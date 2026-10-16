@@ -1,0 +1,27 @@
+# Gerçek veriler ve kuruma özel ayarlar: ASLA repoya girmesin
+fatura.db
+*.db
+*.db-journal
+config.ini
+
+# Fatura / evrak dosyaları
+*.pdf
+*.xlsx
+*.csv
+
+# Derleme çıktıları
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Editör / işletim sistemi
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
