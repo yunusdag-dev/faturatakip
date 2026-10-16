@@ -124,6 +124,11 @@ Ekipten gelen ihtiyaçlara göre planlanan, henüz **yapılmamış** fikirler:
 - Dosyalar kopyalanmaz, yalnızca konumları kaydedilir; evraklar ekibin erişebildiği ortak klasörde durmalıdır.
 - Yalnızca Windows'ta tam çalışır (OCR ve dosya açma işlevleri Windows'a bağlıdır).
 
+## Lisans
+
+Kaynak kod **MIT lisanslıdır** ([LICENSE](LICENSE)): kurumlar dahil kullanabilir, değiştirebilir ve dağıtabilirsiniz.
+Derlenmiş pakette AGPL lisanslı PyMuPDF bulunduğundan, **dağıtım** için bileşen lisanslarına [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) dosyasından bakın. Dahili kullanım kısıtlanmaz.
+
 ## Gizlilik
 
 `fatura.db`, `config.ini` ve fatura PDF'leri `.gitignore` ile repo dışında tutulur. Bu depodaki ekran görüntülerinde yer alan firma ve tutarlar **kurgusaldır**.
