@@ -11,6 +11,7 @@ Ekip içinde ortak ağ üzerinden kullanılan, alış faturalarını kaydeden ve
 - Yıl/ay/firma/tarih filtresi ve arama, aylık özet
 - Biçimlendirilmiş Excel (`.xlsx`) dışa aktarma (CSV de desteklenir)
 - Açık / Koyu / Mavi tema
+- Uygulama ikonu (`ikon.ico`) ve alt şeritte geliştirici imzası, Yardım > Hakkında penceresi
 - Mükerrer kayıt kontrolü (aynı firma + fatura no, aynı PDF)
 
 Tutarlar veritabanında kuruş (tam sayı) olarak tutulur. Dosyalar kopyalanmaz, yalnızca konumları kaydedilir.

@@ -63,6 +63,8 @@ except Exception:
 # ----------------------------------------------------------------------------
 
 UYGULAMA_ADI = "Alış Faturası Kayıt ve Takip"
+GELISTIRICI = "Yunus Dağ"
+IKON_YOLU = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), "ikon.ico")
 UYGULAMA_KLASORU = os.path.dirname(os.path.abspath(sys.argv[0] if sys.argv and sys.argv[0] else __file__))
 CONFIG_YOLU = os.path.join(UYGULAMA_KLASORU, "config.ini")
 
@@ -1625,6 +1627,10 @@ def arayuzu_calistir():
     kok.title(UYGULAMA_ADI)
     kok.geometry("1240x680")
     kok.minsize(980, 520)
+    try:
+        kok.iconbitmap(default=IKON_YOLU)          # tüm pencerelerde uygulama ikonu
+    except tk.TclError:
+        pass
 
     try:
         db = FaturaDB(ayar["veritabani"])
@@ -1651,6 +1657,8 @@ def arayuzu_calistir():
             stil.configure("Oto.TCombobox", fieldbackground=r["oto"], foreground=r["fg"])
             stil.configure("Toplam.TLabel", font=("Segoe UI", 10, "bold"))
             stil.configure("Not.TLabel", foreground=r["not"])
+            stil.configure("Imza.TLabel", foreground=r["not"], font=("Segoe UI", 9))
+            stil.configure("ImzaAd.TLabel", foreground=r["sec"], font=("Segoe UI Semibold", 9))
             stil.map("Toolbutton", foreground=[("selected", r["sec"])])
             kok.configure(bg=r["bg"])
             for w in kok.winfo_children():
@@ -1687,6 +1695,8 @@ def arayuzu_calistir():
         stil.configure("TScrollbar", background=r["dugme"], troughcolor=r["bg"], arrowcolor=r["fg"])
         stil.configure("Toplam.TLabel", font=("Segoe UI", 10, "bold"))
         stil.configure("Not.TLabel", foreground=r["not"])
+        stil.configure("Imza.TLabel", foreground=r["not"], font=("Segoe UI", 9))
+        stil.configure("ImzaAd.TLabel", foreground=r["sec"], font=("Segoe UI Semibold", 9))
         kok.configure(bg=r["bg"])
         kok.option_add("*TCombobox*Listbox.background", r["alan"])
         kok.option_add("*TCombobox*Listbox.foreground", r["fg"])
@@ -1809,6 +1819,13 @@ def arayuzu_calistir():
     for b in (btn_ekle, btn_duzenle, btn_sil, btn_pdf, btn_evrak, btn_klasor, btn_ozet, btn_csv):
         b.pack(side="left", padx=3)
     ttk.Label(alt, textvariable=v_toplam, style="Toplam.TLabel").pack(side="right")
+
+    # ---- imza şeridi ---------------------------------------------------------
+    imza = ttk.Frame(kok, padding=(12, 0, 14, 6))
+    imza.pack(fill="x", side="bottom")
+    ttk.Label(imza, text=GELISTIRICI, style="ImzaAd.TLabel", cursor="hand2").pack(side="right")
+    ttk.Label(imza, text="Developed by ", style="Imza.TLabel").pack(side="right")
+    ttk.Separator(kok, orient="horizontal").pack(fill="x", side="bottom", padx=10)
 
     # ---- liste yenileme ------------------------------------------------------
     def filtre_degerleri():
@@ -2463,6 +2480,10 @@ def arayuzu_calistir():
     m_gor.add_cascade(label="Tema", menu=m_tema)
     menu.add_cascade(label="Dosya", menu=m_dosya)
     menu.add_cascade(label="Görünüm", menu=m_gor)
+    m_yardim = tk.Menu(menu, tearoff=0)
+    m_yardim.add_command(label="Hakkında...", command=lambda: messagebox.showinfo(
+        "Hakkında", "%s\n\nDeveloped by %s" % (UYGULAMA_ADI, GELISTIRICI), parent=kok))
+    menu.add_cascade(label="Yardım", menu=m_yardim)
     kok.configure(menu=menu)
 
     # ---- bağlantılar ---------------------------------------------------------
