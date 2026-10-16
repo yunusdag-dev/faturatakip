@@ -61,7 +61,7 @@ Kod tek dosyada (yaklaşık 2.500 satır) ve katmanlı: ayarlar → yardımcıla
 
 ### Kullanıcılar için (Python gerekmez)
 
-1. Derlenmiş `FaturaTakip` klasörünü (Releases bölümünde yayınlandığında oradan; şimdilik `derle.bat` ile üretilir) kalıcı bir yere kopyalayın.
+1. [Releases](https://github.com/yunusdag-dev/faturatakip/releases/latest) bölümünden `FaturaTakip-...-windows.zip` dosyasını indirip kalıcı bir klasöre çıkarın.
 2. `FaturaTakip.exe` için masaüstü kısayolu oluşturun.
 
 > Exe tek başına çalışmaz; yanındaki `_internal` klasörüyle birlikte durmalıdır.
