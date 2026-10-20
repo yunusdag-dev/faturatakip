@@ -530,6 +530,8 @@ def _kategori_sayfasi_yaz(ws, satirlar, baslik, st):
                     r.get("talep_no") or "", r.get("ek_sayisi") or None, r["pdf_yolu"] or ""]
         for k, d in enumerate(degerler, 1):
             c = ws.cell(row=sat, column=k, value=d)
+            if isinstance(d, str) and d.startswith("="):
+                c.data_type = "s"                  # PDF/DOCX'ten gelen '=...' metni formül olarak çalışmasın
             c.font, c.border = st["normal"], st["kenar"]
             if i % 2:
                 c.fill = st["zebra"]
@@ -620,6 +622,13 @@ def ozet_csv_yaz(yol, ozet):
             w.writerow([x["ay"], x["adet"], tutar_yaz(x["haric"])])
 
 
+def _csv_guvenli(deger):
+    """Excel'in formül sanmaması için =, +, -, @ ile başlayan metnin önüne ' koyar (PDF/DOCX'ten gelen metin olabilir)."""
+    if isinstance(deger, str) and deger[:1] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + deger
+    return deger
+
+
 def csv_yaz(yol, satirlar):
     """Excel'de Türkçe karakter bozulmadan açılır: utf-8-sig + noktalı virgül."""
     with open(yol, "w", newline="", encoding="utf-8-sig") as f:
@@ -627,9 +636,10 @@ def csv_yaz(yol, satirlar):
         w.writerow(["Fatura Tarihi", "Fatura No", "Firma Adı", "Yapılan İş", "Kategori",
                     "Fatura Tutarı (KDV Hariç)", "Talep No", "PDF Konumu"])
         for r in satirlar:
-            w.writerow([tarih_yaz(r["fatura_tarihi"]), r["fatura_no"], r["firma_adi"], r["yapilan_is"] or "",
-                        r.get("kategori") or "", tutar_yaz(r["tutar_haric"]), r.get("talep_no") or "",
-                        r["pdf_yolu"] or ""])
+            w.writerow([tarih_yaz(r["fatura_tarihi"])] + [_csv_guvenli(x) for x in (
+                r["fatura_no"], r["firma_adi"], r["yapilan_is"] or "", r.get("kategori") or "")]
+                + [tutar_yaz(r["tutar_haric"])] + [_csv_guvenli(x) for x in (
+                    r.get("talep_no") or "", r["pdf_yolu"] or "")])
 
 
 # ----------------------------------------------------------------------------
