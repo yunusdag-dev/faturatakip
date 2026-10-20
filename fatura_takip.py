@@ -30,7 +30,9 @@ import subprocess
 import sys
 import tempfile
 import threading
+import zipfile
 import zlib
+import xml.etree.ElementTree as ET
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
@@ -201,7 +203,14 @@ class MukerrerKayit(VeritabaniHatasi):
 
 
 ALANLAR = ["fatura_tarihi", "fatura_no", "firma_adi", "yapilan_is",
-           "tutar_haric", "tutar_dahil", "pdf_yolu"]
+           "tutar_haric", "tutar_dahil", "pdf_yolu", "kategori", "talep_no", "talep_tarihi", "dt_no"]
+
+# Yeni Kayıt formundaki kategori listesi ve Excel çıktısındaki sayfa adları (Faturalar 2026.xlsx ile aynı)
+KATEGORILER = ["Minibüs-Otobüs Kiralama", "Kamyon Kiralama", "İş Makinesi Kiralama", "Asansör Bakım Onarım",
+               "Doğalgaz Faturaları", "Araç Kiralama", "Personel ve Okul Servisi", "Klima-Havalandırma",
+               "Isıtma-Tesisat Bakım Onarım", "Akaryakıt Alımı", "Elektrik İşleri", "İş Makinesi Bakım Onarım",
+               "Yangın Sistemleri", "HGS", "Genel Alım"]
+KATEGORISIZ = "Kategorisiz"     # kategorisi seçilmemiş (eski) kayıtların Excel sayfası
 
 
 class FaturaDB:
@@ -262,6 +271,9 @@ class FaturaDB:
             sutunlar = [r[1] for r in con.execute("PRAGMA table_info(faturalar)")]
             if "vkn" not in sutunlar:
                 con.execute("ALTER TABLE faturalar ADD COLUMN vkn TEXT")
+            for yeni in ("kategori", "talep_no", "talep_tarihi", "dt_no"):
+                if yeni not in sutunlar:
+                    con.execute("ALTER TABLE faturalar ADD COLUMN %s TEXT" % yeni)
             con.execute("CREATE TABLE IF NOT EXISTS firma_vkn (vkn TEXT PRIMARY KEY, firma_adi TEXT NOT NULL)")
             con.execute("""
                 CREATE TABLE IF NOT EXISTS ekler (
@@ -304,11 +316,13 @@ class FaturaDB:
             self._mukerrer_kontrol(con, veri)
             cur = con.execute("""
                 INSERT INTO faturalar (fatura_tarihi, fatura_no, firma_adi, yapilan_is, tutar_haric,
-                    tutar_dahil, pdf_yolu, kaydeden, kayit_tarihi, firma_anahtar, pdf_anahtar, vkn)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    tutar_dahil, pdf_yolu, kaydeden, kayit_tarihi, firma_anahtar, pdf_anahtar, vkn, kategori,
+                    talep_no, talep_tarihi, dt_no)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (veri["fatura_tarihi"], veri["fatura_no"], veri["firma_adi"], veri["yapilan_is"],
-                 veri["tutar_haric"], veri["tutar_dahil"], veri["pdf_yolu"], kullanici, simdi,
-                 self._anahtar_firma(veri), yol_norm(veri.get("pdf_yolu")), veri.get("vkn") or None))
+                 veri["tutar_haric"], veri.get("tutar_dahil"), veri["pdf_yolu"], kullanici, simdi,
+                 self._anahtar_firma(veri), yol_norm(veri.get("pdf_yolu")), veri.get("vkn") or None,
+                 veri.get("kategori") or None, veri.get("talep_no"), veri.get("talep_tarihi"), veri.get("dt_no")))
             self._vkn_isle(con, veri)
             return cur.lastrowid
         return self._calistir(f)
@@ -320,11 +334,13 @@ class FaturaDB:
             self._mukerrer_kontrol(con, veri, kendi_id=fid)
             con.execute("""
                 UPDATE faturalar SET fatura_tarihi=?, fatura_no=?, firma_adi=?, yapilan_is=?,
-                    tutar_haric=?, tutar_dahil=?, pdf_yolu=?, son_duzenleyen=?, duzenleme_tarihi=?,
-                    firma_anahtar=?, pdf_anahtar=?, vkn=COALESCE(NULLIF(?, ''), vkn) WHERE id=?""",
+                    tutar_haric=?, pdf_yolu=?, son_duzenleyen=?, duzenleme_tarihi=?,
+                    firma_anahtar=?, pdf_anahtar=?, vkn=COALESCE(NULLIF(?, ''), vkn), kategori=?,
+                    talep_no=?, talep_tarihi=?, dt_no=? WHERE id=?""",
                 (veri["fatura_tarihi"], veri["fatura_no"], veri["firma_adi"], veri["yapilan_is"],
-                 veri["tutar_haric"], veri["tutar_dahil"], veri["pdf_yolu"], kullanici, simdi,
-                 self._anahtar_firma(veri), yol_norm(veri.get("pdf_yolu")), veri.get("vkn") or "", fid))
+                 veri["tutar_haric"], veri["pdf_yolu"], kullanici, simdi,
+                 self._anahtar_firma(veri), yol_norm(veri.get("pdf_yolu")), veri.get("vkn") or "", veri.get("kategori") or None,
+                 veri.get("talep_no"), veri.get("talep_tarihi"), veri.get("dt_no"), fid))
             self._vkn_isle(con, veri)
         self._calistir(f)
 
@@ -398,8 +414,7 @@ class FaturaDB:
 def toplamlar(satirlar):
     adet = len(satirlar)
     haric = sum(r["tutar_haric"] or 0 for r in satirlar)
-    dahil = sum(r["tutar_dahil"] or 0 for r in satirlar)
-    return adet, haric, dahil
+    return adet, haric
 
 
 AY_ADLARI = ["Ocak", "Şubat", "Mart", "Nisan", "Mayıs", "Haziran",
@@ -423,7 +438,8 @@ def filtrele(satirlar, arama="", firma="", bas=None, bit=None, yil=None, ay=None
         if ay and t[5:7] != "%02d" % ay:
             continue
         if a:
-            havuz = tr_kucuk(" ".join([r["fatura_no"] or "", r["firma_adi"] or "", r["yapilan_is"] or ""]))
+            havuz = tr_kucuk(" ".join([r["fatura_no"] or "", r["firma_adi"] or "", r["yapilan_is"] or "",
+                                    r.get("kategori") or "", r.get("talep_no") or "", r.get("dt_no") or ""]))
             if a not in havuz:
                 continue
         sonuc.append(r)
@@ -431,13 +447,13 @@ def filtrele(satirlar, arama="", firma="", bas=None, bit=None, yil=None, ay=None
 
 
 def aylik_ozet(satirlar, yil):
-    """Seçilen yılın 12 ayı için adet / KDV hariç / KDV dahil toplamları + son satırda TOPLAM."""
+    """Seçilen yılın 12 ayı için adet / KDV hariç toplamları + son satırda TOPLAM."""
     sonuc = []
     for k in range(1, 13):
-        adet, haric, dahil = toplamlar(filtrele(satirlar, yil=yil, ay=k))
-        sonuc.append({"ay": AY_ADLARI[k - 1], "adet": adet, "haric": haric, "dahil": dahil})
+        adet, haric = toplamlar(filtrele(satirlar, yil=yil, ay=k))
+        sonuc.append({"ay": AY_ADLARI[k - 1], "adet": adet, "haric": haric})
     sonuc.append({"ay": "TOPLAM", "adet": sum(x["adet"] for x in sonuc),
-                  "haric": sum(x["haric"] for x in sonuc), "dahil": sum(x["dahil"] for x in sonuc)})
+                  "haric": sum(x["haric"] for x in sonuc)})
     return sonuc
 
 
@@ -465,17 +481,30 @@ def _xlsx_sayfa_adi(metin):
 
 
 def xlsx_yaz(yol, satirlar, baslik="Alış Faturaları"):
-    """Faturaları biçimlendirilmiş bir Excel (.xlsx) tablosu olarak yazar (openpyxl gerekir)."""
+    """Faturaları biçimlendirilmiş bir Excel (.xlsx) çalışma kitabı olarak yazar (openpyxl gerekir).
+    Her kategori ayrı bir sayfadır; kategorisi seçilmemiş eski kayıtlar 'Kategorisiz' sayfasına gider."""
     if openpyxl is None:
         raise RuntimeError("XLSX için 'openpyxl' kütüphanesi kurulu değil.")
-    from openpyxl.utils import get_column_letter
     st = _xlsx_stilleri()
+    gruplar = {}
+    for r in satirlar:
+        ad = r.get("kategori") if r.get("kategori") in KATEGORILER else KATEGORISIZ
+        gruplar.setdefault(ad, []).append(r)
     wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = _xlsx_sayfa_adi(baslik)
-    sutunlar = ["Fatura Tarihi", "Fatura No", "Firma Adı", "Yapılan İş", "Tutar (KDV Hariç)", "KDV Tutarı",
-                "Tutar (KDV Dahil)", "Ek Evrak", "PDF Konumu"]
-    genislik_en_az = [14, 20, 34, 40, 18, 16, 18, 10, 40]
+    wb.remove(wb.active)
+    for ad in KATEGORILER + [KATEGORISIZ]:
+        if ad in gruplar:
+            _kategori_sayfasi_yaz(wb.create_sheet(_xlsx_sayfa_adi(ad)), gruplar[ad], "%s - %s" % (baslik, ad), st)
+    if not wb.sheetnames:
+        _kategori_sayfasi_yaz(wb.create_sheet(_xlsx_sayfa_adi(baslik)), [], baslik, st)
+    wb.save(yol)
+
+
+def _kategori_sayfasi_yaz(ws, satirlar, baslik, st):
+    from openpyxl.utils import get_column_letter
+    sutunlar = ["Fatura Tarihi", "Fatura No", "Firma Adı", "Yapılan İş", "Tutar (KDV Hariç)", "Talep No", "Ek Evrak",
+                "PDF Konumu"]
+    genislik_en_az = [14, 20, 34, 40, 18, 12, 10, 40]
     son = len(sutunlar)
 
     ws["A1"] = "%s   (%d fatura, düzenlenme: %s)" % (baslik, len(satirlar), date.today().strftime("%d.%m.%Y"))
@@ -497,10 +526,8 @@ def xlsx_yaz(yol, satirlar, baslik="Alış Faturaları"):
         except ValueError:
             tarih = r["fatura_tarihi"]
         haric = r["tutar_haric"] / 100 if r["tutar_haric"] is not None else None
-        dahil = r["tutar_dahil"] / 100 if r["tutar_dahil"] is not None else None
-        kdv = (r["tutar_dahil"] - r["tutar_haric"]) / 100 if haric is not None and dahil is not None else None
-        degerler = [tarih, r["fatura_no"], r["firma_adi"], r["yapilan_is"] or "", haric, kdv, dahil,
-                    r.get("ek_sayisi") or None, r["pdf_yolu"] or ""]
+        degerler = [tarih, r["fatura_no"], r["firma_adi"], r["yapilan_is"] or "", haric,
+                    r.get("talep_no") or "", r.get("ek_sayisi") or None, r["pdf_yolu"] or ""]
         for k, d in enumerate(degerler, 1):
             c = ws.cell(row=sat, column=k, value=d)
             c.font, c.border = st["normal"], st["kenar"]
@@ -508,13 +535,13 @@ def xlsx_yaz(yol, satirlar, baslik="Alış Faturaları"):
                 c.fill = st["zebra"]
             if k == 1:
                 c.number_format, c.alignment = "DD.MM.YYYY", st["orta"]
-            elif k in (5, 6, 7):
+            elif k == 5:
                 c.number_format, c.alignment = "#,##0.00", st["sag"]
-            elif k == 8:
+            elif k in (6, 7):
                 c.alignment = st["orta"]
             else:
                 c.alignment = st["sol"]
-        pdf = ws.cell(row=sat, column=9)
+        pdf = ws.cell(row=sat, column=8)
         if r["pdf_yolu"]:
             try:
                 pdf.hyperlink = r["pdf_yolu"]
@@ -528,15 +555,13 @@ def xlsx_yaz(yol, satirlar, baslik="Alış Faturaları"):
         c = ws.cell(row=tr, column=k)
         c.font, c.fill, c.border = st["toplam_yazi"], st["toplam_dolgu"], st["kenar"]
     ws.cell(row=tr, column=3, value="TOPLAM (%d fatura)" % len(sirali)).alignment = st["sag"]
-    for k in (5, 6, 7):
-        harf = get_column_letter(k)
-        c = ws.cell(row=tr, column=k, value="=SUBTOTAL(109,%s%d:%s%d)" % (harf, ilk, harf, bit))
-        c.number_format, c.alignment = "#,##0.00", st["sag"]
-    ws.cell(row=tr, column=8, value="=SUBTOTAL(109,H%d:H%d)" % (ilk, bit)).alignment = st["orta"]
+    c = ws.cell(row=tr, column=5, value="=SUBTOTAL(109,E%d:E%d)" % (ilk, bit))
+    c.number_format, c.alignment = "#,##0.00", st["sag"]
+    ws.cell(row=tr, column=7, value="=SUBTOTAL(109,G%d:G%d)" % (ilk, bit)).alignment = st["orta"]
 
     for k, ad in enumerate(sutunlar, 1):
         en = max([len(str(ws.cell(row=s, column=k).value or "")) for s in range(ilk, bit + 1)] + [len(ad)])
-        sinir = 60 if k in (3, 4, 9) else 24
+        sinir = 60 if k in (3, 4, 8) else 24
         ws.column_dimensions[get_column_letter(k)].width = min(max(genislik_en_az[k - 1], en + 3), sinir)
 
     ws.auto_filter.ref = "A%d:%s%d" % (bas, get_column_letter(son), bit)
@@ -546,7 +571,6 @@ def xlsx_yaz(yol, satirlar, baslik="Alış Faturaları"):
     ws.page_setup.fitToWidth, ws.page_setup.fitToHeight = 1, 0
     ws.sheet_properties.pageSetUpPr = openpyxl.worksheet.properties.PageSetupProperties(fitToPage=True)
     ws.print_title_rows = "%d:%d" % (bas, bas)
-    wb.save(yol)
 
 
 def ozet_xlsx_yaz(yol, ozet, yil):
@@ -559,16 +583,16 @@ def ozet_xlsx_yaz(yol, ozet, yil):
     ws.title = "Aylık Özet %s" % yil
     ws["A1"] = "Aylık Fatura Özeti - %s" % yil
     ws["A1"].font = st["baslik_yazisi"]
-    ws.merge_cells("A1:E1")
+    ws.merge_cells("A1:C1")
     ws.row_dimensions[1].height = 26
-    for k, ad in enumerate(["Ay", "Fatura Adedi", "Tutar (KDV Hariç)", "KDV Tutarı", "Tutar (KDV Dahil)"], 1):
+    for k, ad in enumerate(["Ay", "Fatura Adedi", "Tutar (KDV Hariç)"], 1):
         h = ws.cell(row=3, column=k, value=ad)
         h.font, h.fill, h.border, h.alignment = st["baslik_yazi"], st["baslik_dolgu"], st["kenar"], st["orta"]
     ws.row_dimensions[3].height = 24
     for i, x in enumerate(ozet):
         sat = 4 + i
         toplam = x["ay"] == "TOPLAM"
-        degerler = [x["ay"], x["adet"], x["haric"] / 100, (x["dahil"] - x["haric"]) / 100, x["dahil"] / 100]
+        degerler = [x["ay"], x["adet"], x["haric"] / 100]
         for k, d in enumerate(degerler, 1):
             c = ws.cell(row=sat, column=k, value=d)
             c.border = st["kenar"]
@@ -577,11 +601,11 @@ def ozet_xlsx_yaz(yol, ozet, yil):
                 c.fill = st["toplam_dolgu"]
             elif i % 2:
                 c.fill = st["zebra"]
-            if k >= 3:
+            if k == 3:
                 c.number_format, c.alignment = "#,##0.00", st["sag"]
             elif k == 2:
                 c.alignment = st["orta"]
-    for harf, gen in zip("ABCDE", (16, 16, 22, 20, 22)):
+    for harf, gen in zip("ABC", (16, 16, 22)):
         ws.column_dimensions[harf].width = gen
     ws.freeze_panes = "A4"
     ws.sheet_view.showGridLines = False
@@ -591,24 +615,20 @@ def ozet_xlsx_yaz(yol, ozet, yil):
 def ozet_csv_yaz(yol, ozet):
     with open(yol, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f, delimiter=";")
-        w.writerow(["Ay", "Fatura Adedi", "KDV Hariç Toplam", "KDV Tutarı", "KDV Dahil Toplam"])
+        w.writerow(["Ay", "Fatura Adedi", "KDV Hariç Toplam"])
         for x in ozet:
-            w.writerow([x["ay"], x["adet"], tutar_yaz(x["haric"]), tutar_yaz(x["dahil"] - x["haric"]),
-                        tutar_yaz(x["dahil"])])
+            w.writerow([x["ay"], x["adet"], tutar_yaz(x["haric"])])
 
 
 def csv_yaz(yol, satirlar):
     """Excel'de Türkçe karakter bozulmadan açılır: utf-8-sig + noktalı virgül."""
     with open(yol, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f, delimiter=";")
-        w.writerow(["Fatura Tarihi", "Fatura No", "Firma Adı", "Yapılan İş",
-                    "Fatura Tutarı (KDV Hariç)", "Fatura Tutarı (KDV Dahil)", "KDV Tutarı", "PDF Konumu"])
+        w.writerow(["Fatura Tarihi", "Fatura No", "Firma Adı", "Yapılan İş", "Kategori",
+                    "Fatura Tutarı (KDV Hariç)", "Talep No", "PDF Konumu"])
         for r in satirlar:
-            kdv = None
-            if r["tutar_haric"] is not None and r["tutar_dahil"] is not None:
-                kdv = r["tutar_dahil"] - r["tutar_haric"]
             w.writerow([tarih_yaz(r["fatura_tarihi"]), r["fatura_no"], r["firma_adi"], r["yapilan_is"] or "",
-                        tutar_yaz(r["tutar_haric"]), tutar_yaz(r["tutar_dahil"]), tutar_yaz(kdv),
+                        r.get("kategori") or "", tutar_yaz(r["tutar_haric"]), r.get("talep_no") or "",
                         r["pdf_yolu"] or ""])
 
 
@@ -1600,6 +1620,261 @@ def pdf_bilgi_cikar(yol, ayar=None, sayfa=None):
 
 
 # ----------------------------------------------------------------------------
+# 5b) ALAN OKUMA KURALLARI  (Yeni Kayıt formundaki her satırın "Gözat" butonu)
+# ----------------------------------------------------------------------------
+# Her kural: kural(yol, secenek) -> (deger_metni | None, not_metni)
+# Kuralların kaydı OKUMA_KURALLARI sözlüğündedir: (alan, dosya_uzantisi) -> kural.
+# Fatura tarihi / no / firma / tutar bu sözlükte değildir: fatura PDF'i tek seferde okunur (pdf_bilgi_cikar).
+# Yeni bir alan/dosya türü eklemek için kuralı yazıp sözlüğe bir satır eklemek yeterlidir.
+
+_W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+
+
+def docx_satirlari(yol):
+    """DOCX'in metnini belge sırasıyla satır satır verir (paragraflar ve tablo hücreleri dahil).
+    Ek kütüphane gerekmez: DOCX bir zip, içindeki word/document.xml okunur."""
+    try:
+        with zipfile.ZipFile(yol) as z:
+            ham = z.read("word/document.xml")
+        if b"<!DOCTYPE" in ham or b"<!ENTITY" in ham:   # gerçek Word belgelerinde olmaz; XXE / "billion laughs" önlemi
+            raise ValueError("DOCX dosyası güvenli görünmüyor, okunmadı.")
+        kok = ET.fromstring(ham)
+    except (zipfile.BadZipFile, KeyError, ET.ParseError):
+        raise ValueError("DOCX dosyası açılamadı (bozuk ya da eski .doc biçimi olabilir).")
+    satirlar = []
+    for p in kok.iter(_W + "p"):
+        parca = []
+        for e in p.iter():
+            if e.tag == _W + "t":
+                parca.append(e.text or "")
+            elif e.tag in (_W + "tab", _W + "br"):
+                parca.append(" ")
+        t = " ".join("".join(parca).split())
+        if t:
+            satirlar.append(t)
+    return satirlar
+
+
+def _etiket_sonrasi(satirlar, etiket):
+    """Etiket satırının hemen altındaki (ya da 'Etiket: değer' biçiminde aynı satırdaki) değeri döndürür."""
+    e = tr_kucuk(etiket)
+    for i, satir in enumerate(satirlar):
+        k = tr_kucuk(satir).rstrip(" :")
+        if k == e:
+            return satirlar[i + 1] if i + 1 < len(satirlar) else None
+        if k.startswith(e) and ":" in satir[len(etiket):len(etiket) + 3]:
+            return satir.split(":", 1)[1].strip() or None
+    return None
+
+
+def kural_docx_etiket(etiket, desen=None):
+    """DOCX'te 'etiket' satırının karşılığını okur. Bulunamazsa (varsa) 'desen' tüm metinde aranır."""
+    def kural(yol, secenek):
+        satirlar = docx_satirlari(yol)
+        deger = _etiket_sonrasi(satirlar, etiket)
+        if not deger and desen:
+            m = re.search(desen, "\n".join(satirlar))
+            deger = m.group(0) if m else None
+        return deger, ("" if deger else "Belgede '%s' satırı bulunamadı." % etiket)
+    return kural
+
+
+def _ilk_sayfa_metni(yol):
+    sayfalar, _ = pdf_sayfa_metinleri_mupdf(yol, 1)
+    if not sayfalar or len(sayfalar[0].strip()) < 40:
+        try:
+            sayfalar, _ = pdf_sayfa_metinleri(yol, 1)
+        except Exception:
+            sayfalar = []
+    if (not sayfalar or len(sayfalar[0].strip()) < 40) and os.name == "nt":
+        try:
+            sayfalar = ocr_ile_oku(yol, [0])      # taranmış talep yazısı
+        except Exception:
+            sayfalar = []
+    return sayfalar[0] if sayfalar else ""
+
+
+_TARIH_DESENI = r"\b\d{1,2}[./]\d{1,2}[./]\d{4}\b"
+
+
+def talep_coz(metin):
+    """Talep yazısından (no, tarih_iso, uyarı) çıkarır.
+    No: 'Sayı' satırındaki numaranın son 7 rakamı. Tarih: 'Sayı' satırından önceki (sayfanın sağ üstündeki) tarih."""
+    metin = (metin or "").replace("\xa0", " ")
+    no = tarih = None
+    m = re.search(r"Say[ıiİI]\s*:\s*(\S+)", metin)
+    if m:
+        rakamlar = re.sub(r"\D", "", m.group(1))
+        no = rakamlar[-7:] if len(rakamlar) >= 7 else None
+    t = re.search(_TARIH_DESENI, metin[:m.start()] if m else metin) or re.search(_TARIH_DESENI, metin)
+    if t:
+        try:
+            tarih = tarih_ayristir(t.group(0))
+        except ValueError:
+            pass
+    uyari = ""
+    if not no:
+        uyari = "'Sayı' satırı bulunamadı."
+    elif "talep formu" not in tr_kucuk(metin):
+        uyari = "Bu belge 'Talep Formu' gibi görünmüyor (İhtiyaç Formu olabilir); sayı yine de okundu."
+    return no, tarih, uyari
+
+
+def talep_yaz(no, tarih_iso):
+    """Formdaki tek hücrenin metni: '3570347 - 23.01.2026'."""
+    return " - ".join(x for x in (no or "", tarih_yaz(tarih_iso)) if x)
+
+
+def talep_ayristir(metin):
+    """Hücre metni -> (no, tarih_iso). Tarih yoksa None; biçim bozuksa ValueError."""
+    metin = (metin or "").strip()
+    t = re.search(_TARIH_DESENI, metin)
+    tarih = tarih_ayristir(t.group(0)) if t else None
+    no = (metin[:t.start()] + metin[t.end():] if t else metin).strip(" -–\t")
+    return no or None, tarih
+
+
+def kural_talep_pdf(yol, secenek):
+    no, tarih, uyari = talep_coz(_ilk_sayfa_metni(yol))
+    if not no and not tarih:
+        return None, uyari or "Talep bilgisi okunamadı."
+    return talep_yaz(no, tarih), uyari
+
+
+_IS_BASLIK_ONEKI = re.compile(r"^(hizmet|malzeme)", re.I)
+
+
+def _kenar_cizgileri(sayfa):
+    """Sayfadaki tablo çizgileri -> ([(x, y0, y1) dikey çizgiler], [(y, x0, x1) yatay çizgiler])."""
+    dikey, yatay = [], []
+    try:
+        cizimler = sayfa.get_drawings()
+    except Exception:
+        return dikey, yatay
+    for d in cizimler:
+        r = d["rect"]
+        if r.width < 2 and r.height > 8:
+            dikey.append(((r.x0 + r.x1) / 2, r.y0, r.y1))
+        elif r.height < 2 and r.width > 8:
+            yatay.append(((r.y0 + r.y1) / 2, r.x0, r.x1))
+    return dikey, yatay
+
+
+def is_adi_pdf_tablodan(yol):
+    """Ihtiyaç Formu'ndaki 'HİZMETİN / MALZEMENİN ADI VE KARAKTERİSTİĞİ' başlığının hemen altındaki hücrenin metni.
+    Tablo çizgilerinden başlığın sütunu ve altındaki hücre bulunur (PyMuPDF gerekir); bulunamazsa None."""
+    if fitz is None:
+        return None
+    try:
+        with fitz.open(yol) as belge:
+            if belge.needs_pass or not len(belge):
+                return None
+            sayfa = belge[0]
+            kelimeler = sayfa.get_text("words")
+            dikey, yatay = _kenar_cizgileri(sayfa)
+    except Exception:
+        return None
+    if not dikey:
+        return None
+    for kar in kelimeler:
+        if not tr_kucuk(kar[4]).startswith("karakteristi"):
+            continue
+        # başlığın ilk satırı: hemen üstteki '<Hizmetin|Malzemenin> ADI VE' satırı
+        ust = [w for w in kelimeler if 0 < kar[1] - w[1] < 20 and abs(w[0] - kar[0]) < 150]
+        if not any(tr_kucuk(w[4]) == "adı" for w in ust) or not any(_IS_BASLIK_ONEKI.match(w[4]) for w in ust):
+            continue
+        cx = (kar[0] + kar[2]) / 2
+        sol = max([x for x, y0, y1 in dikey if x < cx - 1 and y0 <= kar[1] + 1 and y1 >= kar[3] - 1], default=None)
+        sag = min([x for x, y0, y1 in dikey if x > cx + 1 and y0 <= kar[1] + 1 and y1 >= kar[3] - 1], default=None)
+        if sol is None or sag is None:
+            continue
+        yler = sorted(y for y, x0, x1 in yatay if x0 <= cx <= x1 and y >= kar[3] - 1)
+        if not yler:
+            continue
+        bas = yler[0]                                    # başlık hücresinin alt kenarı
+        bit = next((y for y in yler if y > bas + 3), bas + 150)
+        satirlar = {}
+        for w in kelimeler:
+            mx, my = (w[0] + w[2]) / 2, (w[1] + w[3]) / 2
+            if sol < mx < sag and bas < my < bit:
+                satirlar.setdefault(round(my / 4), []).append(w)
+        metin = " ".join(" ".join(x[4] for x in sorted(s, key=lambda x: x[0]))
+                         for _, s in sorted(satirlar.items()))
+        return " ".join(metin.split()) or None
+    return None
+
+
+_IS_DURDUR = re.compile(r"^\d+\s*(adet|ad\.?)?$|\d{1,2}[/.]\d{1,2}[/.]\d{4}|tarih|imza|ihtiyaç sahibi|alt birim|stok|"
+                        r"adı soyadı|ünvan", re.I)
+_IS_MIKTAR = re.compile(r"\s+\d+\s*(?:adet|ad\.?)\b(\s+\d+)*", re.I)
+_IS_BASLIK_ARTIGI = re.compile(r"^(kodu|birimi|miktar[ıi]?|miktar|\(varsa\)|proje kodu|karakteristi.*|"
+                               r"(hizmet|malzeme)\w*\s+ad[ıi]\s+ve)$", re.I)
+
+
+def is_adi_pdf_metinden(metin):
+    """Tablo çizgisi okunamadığında (taranmış PDF / PyMuPDF yok): 'KARAKTERİSTİĞİ' başlığından sonraki satırlar,
+    başlığın yan sütun başlıkları atlanıp miktar/tarih/imza satırına gelene kadar alınır."""
+    satirlar = [s.strip() for s in (metin or "").splitlines() if s.strip()]
+    for i, s in enumerate(satirlar):
+        if not tr_kucuk(s).startswith("karakteristi"):
+            continue
+        sonuc = []
+        for t in satirlar[i + 1:i + 12]:
+            if not sonuc and _IS_BASLIK_ARTIGI.match(t.strip()):
+                continue
+            if _IS_DURDUR.search(t):
+                break
+            sonuc.append(_IS_MIKTAR.sub("", t))        # satır içindeki '1 Adet' miktar sütunu karışmasın
+        if sonuc:
+            return " ".join(" ".join(sonuc).split())
+    return None
+
+
+def kural_is_adi_pdf(yol, secenek):
+    deger = is_adi_pdf_tablodan(yol) or is_adi_pdf_metinden(_ilk_sayfa_metni(yol))
+    return deger, ("" if deger else "PDF'te 'Hizmetin / Malzemenin adı ve karakteristiği' başlığı bulunamadı.")
+
+
+OKUMA_KURALLARI = {
+    ("is", ".pdf"): kural_is_adi_pdf,
+    ("is", ".docx"): kural_docx_etiket("İşin Adı"),
+    ("dt", ".docx"): kural_docx_etiket("Doğrudan Temin Numarası", r"\b\d{2}DT\d{5,}\b"),
+    ("talep", ".pdf"): kural_talep_pdf,
+}
+OKUNABILIR_TURLER = (".pdf", ".docx")
+
+
+FATURA_ALANLARI = ("tarih", "no", "firma", "haric")
+DOCX_BIRLIKTE = ("is", "dt")     # Doğrudan Temin Onay Belgesi (DOCX) seçilince bu alanlar birlikte doldurulur
+
+
+def okunacak_alanlar(alan, yol):
+    """Gözat'a basılan alanla birlikte aynı dosyadan doldurulacak alanlar."""
+    if alan in DOCX_BIRLIKTE and yol.lower().endswith(".docx"):
+        return list(DOCX_BIRLIKTE)
+    return [alan]
+
+
+def alanlari_oku(alan, yol, secenek=None):
+    """okunacak_alanlar() için her alanı okur -> {alan: (deger | None, not_metni)}."""
+    secenek = secenek if secenek is not None else {}
+    return {a: alan_oku(a, yol, secenek) for a in okunacak_alanlar(alan, yol)}
+
+
+def alan_oku(alan, yol, secenek=None):
+    """Seçilen dosyadan 'alan' için değeri okur -> (deger | None, not_metni).
+    Dosya türü (PDF / DOCX) desteklenmiyorsa ya da o alan o tür için kural tanımlı değilse deger None gelir."""
+    secenek = secenek if secenek is not None else {}
+    uzanti = os.path.splitext(yol)[1].lower()
+    if uzanti not in OKUNABILIR_TURLER:
+        return None, "Desteklenmeyen dosya türü (%s). PDF veya DOCX seçin." % (uzanti or "uzantısız")
+    kural = OKUMA_KURALLARI.get((alan, uzanti))
+    if kural is None:
+        return None, "Bu alan için %s okuma kuralı henüz tanımlı değil." % uzanti.lstrip(".").upper()
+    return kural(yol, secenek)
+
+
+# ----------------------------------------------------------------------------
 # 6) ARAYÜZ
 # ----------------------------------------------------------------------------
 
@@ -1790,9 +2065,11 @@ def arayuzu_calistir():
         ("fatura_tarihi", "Fatura Tarihi", 95, "center"),
         ("fatura_no", "Fatura No", 150, "w"),
         ("firma_adi", "Firma Adı", 340, "w"),
-        ("yapilan_is", "Yapılan İş", 280, "w"),
+        ("yapilan_is", "İşin Adı", 280, "w"),
+        ("kategori", "Kategori", 170, "w"),
+        ("talep", "Talep No - Tarih", 150, "w"),
+        ("dt_no", "DT No", 100, "w"),
         ("tutar_haric", "Tutar (KDV Hariç)", 130, "e"),
-        ("tutar_dahil", "Tutar (KDV Dahil)", 130, "e"),
         ("pdf_var", "PDF", 45, "center"),
         ("ek_sayisi", "Ek", 40, "center"),
     ]
@@ -1808,7 +2085,7 @@ def arayuzu_calistir():
     # ---- alt bar -------------------------------------------------------------
     alt = ttk.Frame(kok, padding=(8, 4, 8, 8))
     alt.pack(fill="x")
-    btn_ekle = ttk.Button(alt, text="Yeni Fatura")
+    btn_ekle = ttk.Button(alt, text="Yeni Kayıt")
     btn_duzenle = ttk.Button(alt, text="Düzenle")
     btn_sil = ttk.Button(alt, text="Sil")
     btn_pdf = ttk.Button(alt, text="PDF'i Aç")
@@ -1816,7 +2093,8 @@ def arayuzu_calistir():
     btn_klasor = ttk.Button(alt, text="Klasörde Göster")
     btn_ozet = ttk.Button(alt, text="Aylık Özet")
     btn_csv = ttk.Button(alt, text="Excel'e Aktar")
-    for b in (btn_ekle, btn_duzenle, btn_sil, btn_pdf, btn_evrak, btn_klasor, btn_ozet, btn_csv):
+    btn_satinalma = ttk.Button(alt, text="Satınalmaya Aktar")
+    for b in (btn_ekle, btn_duzenle, btn_sil, btn_pdf, btn_evrak, btn_klasor, btn_ozet, btn_csv, btn_satinalma):
         b.pack(side="left", padx=3)
     ttk.Label(alt, textvariable=v_toplam, style="Toplam.TLabel").pack(side="right")
 
@@ -1840,7 +2118,7 @@ def arayuzu_calistir():
         return bas, bit
 
     def anahtar(r, sutun):
-        if sutun in ("tutar_haric", "tutar_dahil"):
+        if sutun == "tutar_haric":
             return r[sutun] if r[sutun] is not None else -1
         if sutun == "pdf_var":
             return 1 if r["pdf_yolu"] else 0
@@ -1848,7 +2126,9 @@ def arayuzu_calistir():
             return r.get("ek_sayisi") or 0
         if sutun == "fatura_tarihi":
             return r["fatura_tarihi"] or ""
-        return tr_kucuk(r[sutun] or "")
+        if sutun == "talep":
+            return (r.get("talep_tarihi") or "", r.get("talep_no") or "")
+        return tr_kucuk(r.get(sutun) or "")
 
     def goster(donem=""):
         tree.delete(*tree.get_children())
@@ -1858,12 +2138,13 @@ def arayuzu_calistir():
         for sira, r in enumerate(satirlar):
             tree.insert("", "end", iid=str(r["id"]), tags=("cift",) if sira % 2 else (), values=(
                 tarih_yaz(r["fatura_tarihi"]), r["fatura_no"], r["firma_adi"], r["yapilan_is"] or "",
-                tutar_yaz(r["tutar_haric"]), tutar_yaz(r["tutar_dahil"]), "✔" if r["pdf_yolu"] else "",
+                r.get("kategori") or "", talep_yaz(r.get("talep_no"), r.get("talep_tarihi")), r.get("dt_no") or "",
+                tutar_yaz(r["tutar_haric"]), "✔" if r["pdf_yolu"] else "",
                 r.get("ek_sayisi") or ""))
         durum["gorunen"] = satirlar
-        adet, haric, dahil = toplamlar(satirlar)
-        v_toplam.set("%s%d fatura   |   KDV Hariç: %s   |   KDV Dahil: %s"
-                     % (donem + "  -  " if donem else "", adet, tutar_yaz(haric, True), tutar_yaz(dahil, True)))
+        adet, haric = toplamlar(satirlar)
+        v_toplam.set("%s%d fatura   |   KDV Hariç: %s"
+                     % (donem + "  -  " if donem else "", adet, tutar_yaz(haric, True)))
         for ad, baslik, _, _ in sutunlar:
             ok = (" ▼" if azalan else " ▲") if ad == sutun else ""
             tree.heading(ad, text=baslik + ok)
@@ -1944,7 +2225,7 @@ def arayuzu_calistir():
             return "PDF'den okunamadı. %s Bilgileri elle girebilirsiniz." % (sonuc["hata"] or "")
         if bulunan == 0:
             return "%s ama fatura bilgisi ayıklanamadı. Bilgileri elle girin." % kaynak
-        return "%s. %d/5 alan bulundu; sarı alanları mutlaka kontrol edin. (Yapılan İş elle girilir.)" % (kaynak, bulunan)
+        return "%s. %d/4 alan bulundu; sarı alanları mutlaka kontrol edin. (Yapılan İş elle girilir.)" % (kaynak, bulunan)
 
     # ---- fatura formu --------------------------------------------------------
     def form_ac(fid=None):
@@ -1953,7 +2234,7 @@ def arayuzu_calistir():
             messagebox.showwarning(UYGULAMA_ADI, "Kayıt bulunamadı (başkası silmiş olabilir).", parent=kok)
             yenile()
             return
-        pen = yeni_pencere("Fatura Düzenle" if fid else "Yeni Fatura")
+        pen = yeni_pencere("Kayıt Düzenle" if fid else "Yeni Kayıt")
         pen.grab_set()
         pen.resizable(False, False)
 
@@ -1962,75 +2243,125 @@ def arayuzu_calistir():
             "no": tk.StringVar(value=mevcut["fatura_no"] if mevcut else ""),
             "firma": tk.StringVar(value=mevcut["firma_adi"] if mevcut else ""),
             "is": tk.StringVar(value=(mevcut["yapilan_is"] or "") if mevcut else ""),
+            "kategori": tk.StringVar(value=(mevcut.get("kategori") or "") if mevcut else ""),
             "haric": tk.StringVar(value=tutar_yaz(mevcut["tutar_haric"]) if mevcut else ""),
-            "dahil": tk.StringVar(value=tutar_yaz(mevcut["tutar_dahil"]) if mevcut else ""),
+            "talep": tk.StringVar(value=talep_yaz(mevcut.get("talep_no"), mevcut.get("talep_tarihi")) if mevcut else ""),
+            "dt": tk.StringVar(value=(mevcut.get("dt_no") or "") if mevcut else ""),
             "pdf": tk.StringVar(value=(mevcut["pdf_yolu"] or "") if mevcut else ""),
             "vkn": tk.StringVar(value=(mevcut.get("vkn") or "") if mevcut else ""),
             "sayfa": tk.StringVar(value=""),
         }
         v_durum = tk.StringVar(value="")
         son_metin = {"metin": ""}
+        son_klasor = {"yol": ""}
+        okuma_secenek = {"ayar": ayar}
 
         cerceve = ttk.Frame(pen, padding=14)
         cerceve.pack()
-        etiketler = [("Fatura Tarihi (GG.AA.YYYY)", "tarih"), ("Fatura No", "no"), ("Firma Adı", "firma"),
-                     ("Yapılan İş", "is"), ("Tutar (KDV Hariç)", "haric"), ("Tutar (KDV Dahil)", "dahil")]
+        # (etiket, anahtar, Gözat var mı)
+        etiketler = [("Kategori", "kategori", False), ("Fatura Tarihi (GG.AA.YYYY)", "tarih", True),
+                     ("Fatura No", "no", True), ("Firma Adı", "firma", True), ("İşin Adı", "is", True),
+                     ("Tutar (KDV Hariç)", "haric", True), ("Talep No - Talep Tarihi", "talep", True),
+                     ("DT Numarası", "dt", True)]
         girisler = {}
+        gozat_dugmeleri = []
 
         def normal_stil(k):
-            girisler[k].configure(style="TCombobox" if k == "firma" else "TEntry")
+            girisler[k].configure(style="TCombobox" if k in ("firma", "kategori") else "TEntry")
 
-        for i, (et, k) in enumerate(etiketler):
-            ttk.Label(cerceve, text=et).grid(row=i, column=0, sticky="w", pady=4)
-            if k == "firma":
-                g = ttk.Combobox(cerceve, textvariable=v[k], width=52, values=db.firmalar())
-                g.bind("<<ComboboxSelected>>", lambda e, kk=k: normal_stil(kk))
-            else:
-                g = ttk.Entry(cerceve, textvariable=v[k], width=55 if k not in ("haric", "dahil") else 20)
-            g.bind("<Key>", lambda e, kk=k: normal_stil(kk))
-            g.grid(row=i, column=1, sticky="w", padx=(10, 0), pady=4, columnspan=2)
-            girisler[k] = g
+        def dosya_sec(baslik):
+            ilk = son_klasor["yol"]
+            if not ilk and v["pdf"].get() and os.path.isdir(os.path.dirname(v["pdf"].get())):
+                ilk = os.path.dirname(v["pdf"].get())
+            if not ilk and ayar["tarama_klasoru"] and os.path.isdir(ayar["tarama_klasoru"]):
+                ilk = ayar["tarama_klasoru"]
+            yol = filedialog.askopenfilename(
+                parent=pen, title=baslik, initialdir=ilk or None,
+                filetypes=[("PDF ve Word", "*.pdf *.docx"), ("PDF dosyaları", "*.pdf"),
+                           ("Word belgeleri", "*.docx"), ("Tüm dosyalar", "*.*")])
+            if yol:
+                yol = os.path.normpath(yol)
+                son_klasor["yol"] = os.path.dirname(yol)
+            return yol
 
-        kdv_cerceve = ttk.Frame(cerceve)
-        kdv_cerceve.grid(row=5, column=1, sticky="e", columnspan=2)
-        v_oran = tk.StringVar(value="20")
-        ttk.Label(kdv_cerceve, text="KDV %").pack(side="left")
-        ttk.Entry(kdv_cerceve, textvariable=v_oran, width=4).pack(side="left", padx=3)
-
-        def kdv_hesapla():
-            try:
-                h = tutar_ayristir(v["haric"].get())
-                if h is None:
-                    raise ValueError("Önce KDV hariç tutarı girin.")
-                oran = Decimal(v_oran.get().replace(",", ".") or "0")
-                d = int((Decimal(h) * (100 + oran) / 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
-                v["dahil"].set(tutar_yaz(d))
-                normal_stil("dahil")
-            except (ValueError, InvalidOperation) as ex:
-                messagebox.showwarning(UYGULAMA_ADI, str(ex), parent=pen)
-        ttk.Button(kdv_cerceve, text="Dahil'i hesapla", command=kdv_hesapla).pack(side="left")
-
-        ttk.Label(cerceve, text="PDF Dosyası").grid(row=6, column=0, sticky="w", pady=4)
-        ttk.Entry(cerceve, textvariable=v["pdf"], width=55).grid(row=6, column=1, sticky="w", padx=(10, 0), pady=4)
-        pdf_dugmeleri = ttk.Frame(cerceve)
-        pdf_dugmeleri.grid(row=6, column=2, padx=6)
-
-        # ---- PDF'den otomatik doldurma
-        def pdf_oku(sessiz=False):
-            yol = v["pdf"].get().strip()
-            if not yol or not os.path.exists(yol):
-                if not sessiz:
-                    messagebox.showwarning(UYGULAMA_ADI, "Önce okunacak PDF dosyasını seçin (Gözat).", parent=pen)
+        def alan_gozat(k, et):
+            """Satırın kendi Gözat'ı: seçilen PDF / DOCX dosyasından bu satırın değerini okur.
+            İşin Adı / DT Numarası için DOCX seçilirse ikisi birlikte doldurulur."""
+            if k in FATURA_ALANLARI:
+                pdf_gozat(oku=True)   # fatura bilgileri tek bir fatura PDF'inden birlikte okunur
                 return
-            sayfa_spec = v["sayfa"].get().strip()
-            v_durum.set("PDF okunuyor... (resim olarak taranmış çok sayfalı belgelerde 30-60 saniye sürebilir)")
-            btn_oku.state(["disabled"])
+            yol = dosya_sec("%s için dosya seçin" % et)
+            if not yol:
+                return
+            okuma_secenek["sayfa"] = v["sayfa"].get().strip()
+            adlar = {kk: ee for ee, kk, _ in etiketler}
+            v_durum.set("%s okunuyor... (taranmış PDF'lerde biraz sürebilir)" % et)
+            for b in gozat_dugmeleri:
+                b.state(["disabled"])
 
             def bitti(sonuc, hata):
                 try:
                     if not pen.winfo_exists():
                         return
-                    btn_oku.state(["!disabled"])
+                    for b in gozat_dugmeleri:
+                        b.state(["!disabled"])
+                except tk.TclError:
+                    return
+                if hata or not sonuc:
+                    v_durum.set("%s okunamadı: %s" % (et, hata or "bilinmeyen hata"))
+                    return
+                dolan, eksik = [], []
+                for alan, (deger, nt) in sonuc.items():
+                    if deger:
+                        v[alan].set(deger)
+                        girisler[alan].configure(style="Oto.TEntry")
+                        dolan.append(adlar[alan])
+                    else:
+                        eksik.append("%s: %s" % (adlar[alan], nt))
+                mesaj = ""
+                if dolan:
+                    mesaj = "%s okundu; sarı alanları kontrol edin." % ", ".join(dolan)
+                v_durum.set((mesaj + " " + " ".join(eksik)).strip() if eksik or mesaj else "")
+            arka_planda(lambda: alanlari_oku(k, yol, okuma_secenek), bitti)
+
+        for i, (et, k, gozat_var) in enumerate(etiketler):
+            ttk.Label(cerceve, text=et).grid(row=i, column=0, sticky="w", pady=4)
+            if k == "kategori":
+                g = ttk.Combobox(cerceve, textvariable=v[k], width=52, values=KATEGORILER, state="readonly")
+                g.bind("<<ComboboxSelected>>", lambda e, kk=k: normal_stil(kk))
+            elif k == "firma":
+                g = ttk.Combobox(cerceve, textvariable=v[k], width=52, values=db.firmalar())
+                g.bind("<<ComboboxSelected>>", lambda e, kk=k: normal_stil(kk))
+            else:
+                g = ttk.Entry(cerceve, textvariable=v[k], width={"haric": 20, "dt": 20, "talep": 30}.get(k, 55))
+            g.bind("<Key>", lambda e, kk=k: normal_stil(kk))
+            g.grid(row=i, column=1, sticky="w", padx=(10, 0), pady=4)
+            girisler[k] = g
+            if gozat_var:
+                b = ttk.Button(cerceve, text="Gözat...", command=lambda kk=k, ee=et: alan_gozat(kk, ee))
+                b.grid(row=i, column=2, padx=(6, 0))
+                gozat_dugmeleri.append(b)
+
+        s_pdf = len(etiketler)
+        ttk.Label(cerceve, text="PDF Dosyası").grid(row=s_pdf, column=0, sticky="w", pady=4)
+        ttk.Entry(cerceve, textvariable=v["pdf"], width=55).grid(row=s_pdf, column=1, sticky="w", padx=(10, 0), pady=4)
+
+        # ---- fatura PDF'inden tüm fatura alanlarını bir seferde doldurma (yeni kayıtta dosya seçilince)
+        def pdf_oku():
+            yol = v["pdf"].get().strip()
+            if not yol or not os.path.exists(yol):
+                return
+            sayfa_spec = v["sayfa"].get().strip()
+            v_durum.set("PDF okunuyor... (resim olarak taranmış çok sayfalı belgelerde 30-60 saniye sürebilir)")
+            for b in gozat_dugmeleri + [btn_pdf_gozat]:
+                b.state(["disabled"])
+
+            def bitti(sonuc, hata):
+                try:
+                    if not pen.winfo_exists():
+                        return
+                    for b in gozat_dugmeleri + [btn_pdf_gozat]:
+                        b.state(["!disabled"])
                 except tk.TclError:
                     return
                 if hata or not sonuc:
@@ -2052,8 +2383,7 @@ def arayuzu_calistir():
                         a["firma_adi"] = bilinen     # aynı firma hep aynı yazımla gelsin
                 bulunan = 0
                 eslesme = [("fatura_tarihi", "tarih", tarih_yaz), ("fatura_no", "no", str),
-                           ("firma_adi", "firma", str),
-                           ("tutar_haric", "haric", tutar_yaz), ("tutar_dahil", "dahil", tutar_yaz)]
+                           ("firma_adi", "firma", str), ("tutar_haric", "haric", tutar_yaz)]
                 for alan, k, bicim in eslesme:
                     if alan in a and a[alan] not in (None, ""):
                         v[k].set(bicim(a[alan]))
@@ -2062,39 +2392,44 @@ def arayuzu_calistir():
                 v_durum.set((durum_metni(sonuc, bulunan) + "  " + sonuc.get("sayfa_bilgisi", "")).strip())
             arka_planda(lambda: pdf_bilgi_cikar(yol, ayar, sayfa_spec or None), bitti)
 
-        def gozat():
-            ilk = ""
-            if v["pdf"].get() and os.path.isdir(os.path.dirname(v["pdf"].get())):
-                ilk = os.path.dirname(v["pdf"].get())
-            elif ayar["tarama_klasoru"] and os.path.isdir(ayar["tarama_klasoru"]):
-                ilk = ayar["tarama_klasoru"]
-            yol = filedialog.askopenfilename(parent=pen, title="Fatura PDF'ini seçin", initialdir=ilk or None,
-                                             filetypes=[("PDF dosyaları", "*.pdf"), ("Tüm dosyalar", "*.*")])
-            if yol:
-                v["pdf"].set(os.path.normpath(yol))
-                v["sayfa"].set("")                # yeni dosyada sayfa otomatik bulunur
-                if not fid:           # yeni kayıtta seçer seçmez otomatik oku
-                    pdf_oku(sessiz=True)
+        def pdf_gozat(oku=None):
+            """Fatura PDF'ini seçer. oku=None: yalnızca yeni kayıtta seçer seçmez fatura alanlarını okur;
+            oku=True: (fatura alanlarının kendi Gözat'ı) kayıt düzenlenirken de okur."""
+            yol = dosya_sec("Fatura PDF'ini seçin")
+            if not yol:
+                return
+            if not yol.lower().endswith(".pdf"):
+                v_durum.set("Fatura bilgileri yalnızca PDF'ten okunur. Fatura PDF'ini seçin.")
+                return
+            v["pdf"].set(yol)
+            v["sayfa"].set("")                    # yeni dosyada sayfa otomatik bulunur
+            if oku or (oku is None and not fid):
+                pdf_oku()
 
-        ttk.Button(pdf_dugmeleri, text="Gözat...", command=gozat).pack(side="left")
-        btn_oku = ttk.Button(pdf_dugmeleri, text="PDF'den Oku", command=pdf_oku)
-        btn_oku.pack(side="left", padx=(4, 0))
+        btn_pdf_gozat = ttk.Button(cerceve, text="Gözat...", command=pdf_gozat)
+        btn_pdf_gozat.grid(row=s_pdf, column=2, padx=(6, 0))
 
         sayfa_cerceve = ttk.Frame(cerceve)
-        sayfa_cerceve.grid(row=7, column=1, columnspan=2, sticky="w", padx=(10, 0))
+        sayfa_cerceve.grid(row=s_pdf + 1, column=1, columnspan=2, sticky="w", padx=(10, 0))
         ttk.Label(sayfa_cerceve, text="(Dosya kopyalanmaz, yalnızca konumu kaydedilir.)",
                   style="Not.TLabel").pack(side="left")
         ttk.Label(sayfa_cerceve, text="     Fatura sayfası:").pack(side="left")
         ttk.Entry(sayfa_cerceve, textvariable=v["sayfa"], width=7).pack(side="left", padx=4)
         ttk.Label(sayfa_cerceve, text="(boş = otomatik bul; örn. 7 ya da 7-8)", style="Not.TLabel").pack(side="left")
-        ttk.Label(cerceve, textvariable=v_durum, style="Not.TLabel", wraplength=560, justify="left").grid(
-            row=8, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Label(cerceve, textvariable=v_durum, style="Not.TLabel", wraplength=600, justify="left").grid(
+            row=s_pdf + 2, column=0, columnspan=3, sticky="w", pady=(6, 0))
         ttk.Button(cerceve, text="Okunan metni göster",
                    command=lambda: metin_goster("PDF'den okunan ham metin", son_metin["metin"])).grid(
-            row=9, column=0, columnspan=2, sticky="w", pady=(4, 0))
+            row=s_pdf + 3, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
         def kaydet():
             try:
+                if v["kategori"].get() not in KATEGORILER:
+                    raise ValueError("Kategori seçin.")
+                try:
+                    talep_no, talep_tarihi = talep_ayristir(v["talep"].get())
+                except ValueError:
+                    raise ValueError("Talep hücresi '3570347 - 23.01.2026' biçiminde olmalı (tarih GG.AA.YYYY).")
                 if not v["firma"].get().strip():
                     raise ValueError("Firma adı boş olamaz.")
                 if not v["no"].get().strip():
@@ -2104,16 +2439,15 @@ def arayuzu_calistir():
                     "fatura_no": v["no"].get().strip(),
                     "firma_adi": v["firma"].get().strip(),
                     "yapilan_is": v["is"].get().strip(),
+                    "kategori": v["kategori"].get(),
+                    "talep_no": talep_no, "talep_tarihi": talep_tarihi,
+                    "dt_no": v["dt"].get().strip() or None,
                     "tutar_haric": tutar_ayristir(v["haric"].get()),
-                    "tutar_dahil": tutar_ayristir(v["dahil"].get()),
                     "pdf_yolu": v["pdf"].get().strip(),
                     "vkn": v["vkn"].get().strip(),
                 }
-                if veri["tutar_haric"] is None and veri["tutar_dahil"] is None:
-                    raise ValueError("En az bir tutar girin.")
-                if (veri["tutar_haric"] is not None and veri["tutar_dahil"] is not None
-                        and veri["tutar_dahil"] < veri["tutar_haric"]):
-                    raise ValueError("KDV dahil tutar, KDV hariç tutardan küçük olamaz.")
+                if veri["tutar_haric"] is None:
+                    raise ValueError("KDV hariç tutarı girin.")
                 if veri["pdf_yolu"] and not os.path.exists(veri["pdf_yolu"]):
                     if not messagebox.askyesno(UYGULAMA_ADI, "Seçilen PDF dosyası bulunamıyor.\n"
                                                "Yine de bu yolla kaydedilsin mi?", parent=pen):
@@ -2132,14 +2466,14 @@ def arayuzu_calistir():
             yenile()
 
         dugme = ttk.Frame(cerceve)
-        dugme.grid(row=10, column=0, columnspan=3, pady=(14, 0), sticky="e")
+        dugme.grid(row=12, column=0, columnspan=3, pady=(14, 0), sticky="e")
         ttk.Button(dugme, text="Kaydet", command=kaydet).pack(side="left", padx=4)
         ttk.Button(dugme, text="Vazgeç", command=pen.destroy).pack(side="left", padx=4)
         if mevcut:
             ttk.Label(cerceve, style="Not.TLabel", text="Kaydeden: %s  (%s)%s" % (
                 mevcut["kaydeden"] or "-", mevcut["kayit_tarihi"] or "",
                 ("   |   Son düzenleyen: %s (%s)" % (mevcut["son_duzenleyen"], mevcut["duzenleme_tarihi"]))
-                if mevcut["son_duzenleyen"] else "")).grid(row=11, column=0, columnspan=3, sticky="w", pady=(10, 0))
+                if mevcut["son_duzenleyen"] else "")).grid(row=13, column=0, columnspan=3, sticky="w", pady=(10, 0))
         girisler["tarih"].focus_set()
         pen.bind("<Escape>", lambda e: pen.destroy())
 
@@ -2170,8 +2504,7 @@ def arayuzu_calistir():
             satirlar += ["", "BULUNAN ALANLAR:"]
             for ad, anahtar_, bicim in [("Fatura Tarihi", "fatura_tarihi", tarih_yaz), ("Fatura No", "fatura_no", str),
                                         ("Firma Adı", "firma_adi", str), ("VKN", "vkn", str),
-                                        ("Tutar (KDV Hariç)", "tutar_haric", tutar_yaz),
-                                        ("Tutar (KDV Dahil)", "tutar_dahil", tutar_yaz)]:
+                                        ("Tutar (KDV Hariç)", "tutar_haric", tutar_yaz)]:
                 satirlar.append("  %-18s %s" % (ad, bicim(a[anahtar_]) if anahtar_ in a else "- bulunamadı -"))
             satirlar += ["", "---------- OKUNAN HAM METİN ----------", sonuc["metin"] or "(metin yok)"]
             metin_goster("PDF Okuma Testi", "\n".join(satirlar))
@@ -2189,8 +2522,7 @@ def arayuzu_calistir():
         cb = ttk.Combobox(ust_, textvariable=v_y, values=[str(y) for y in yillar], width=8, state="readonly")
         cb.pack(side="left", padx=6)
         kolonlar = [("ay", "Ay", 110, "w"), ("adet", "Fatura Adedi", 100, "center"),
-                    ("haric", "KDV Hariç Toplam", 150, "e"), ("kdv", "KDV Tutarı", 130, "e"),
-                    ("dahil", "KDV Dahil Toplam", 150, "e")]
+                    ("haric", "KDV Hariç Toplam", 150, "e")]
         agac = ttk.Treeview(pen, columns=[k[0] for k in kolonlar], show="headings", height=14)
         for ad, baslik, gen, hiza in kolonlar:
             agac.heading(ad, text=baslik)
@@ -2208,8 +2540,7 @@ def arayuzu_calistir():
                 return
             for x in veri_["ozet"]:
                 agac.insert("", "end", tags=("toplam",) if x["ay"] == "TOPLAM" else (), values=(
-                    x["ay"], x["adet"], tutar_yaz(x["haric"], True), tutar_yaz(x["dahil"] - x["haric"], True),
-                    tutar_yaz(x["dahil"], True)))
+                    x["ay"], x["adet"], tutar_yaz(x["haric"], True)))
 
         def aktar():
             tipler = [("Excel çalışma kitabı", "*.xlsx"), ("CSV (Excel'de açılır)", "*.csv")] if openpyxl else \
@@ -2465,6 +2796,11 @@ def arayuzu_calistir():
         except OSError as e:
             hata_goster(e)
 
+    def satinalma_btn():
+        # TODO: Satınalma Excel'inin sütun başlıkları ve sırası belli olunca yazılacak (kategori sayfaları olmayacak).
+        messagebox.showinfo(UYGULAMA_ADI, "Satınalma Excel'i biçimi henüz tanımlanmadı.\n"
+                                          "Biçim verildiğinde bu düğme kayıtları o biçimde aktaracak.", parent=kok)
+
     # ---- menü ----------------------------------------------------------------
     menu = tk.Menu(kok)
     m_dosya = tk.Menu(menu, tearoff=0)
@@ -2495,6 +2831,7 @@ def arayuzu_calistir():
     btn_evrak.configure(command=lambda: evrak_penceresi())
     btn_ozet.configure(command=ozet_penceresi)
     btn_csv.configure(command=csv_btn)
+    btn_satinalma.configure(command=satinalma_btn)
     btn_temizle.configure(command=temizle)
     tree.bind("<Double-1>", lambda e: evrak_penceresi())
     tree.bind("<Return>", duzenle)

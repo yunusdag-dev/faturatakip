@@ -30,12 +30,13 @@ Alış faturalarını kaydetmek, her faturada firma / numara / tarih / tutarı e
 
 | | |
 |---|---|
-| **PDF'den otomatik doldurma** | Tarih, fatura no, firma, VKN/TCKN, KDV hariç/dahil tutar. Sonuçları kullanıcı kontrol edip kaydeder; hiçbir şey onaysız kaydedilmez. |
+| **Satır başına Gözat ile doldurma** | Yeni Kayıt formunda her satırın kendi Gözat'ı vardır; PDF, DOCX veya XLSX seçilir. Fatura PDF'inden tarih, fatura no, firma, KDV hariç tutar; Talep Formu PDF'inden talep no ve tarih; İhtiyaç Formu PDF'inde "Hizmetin/Malzemenin adı ve karakteristiği" başlığının altındaki açıklama işin adı olarak, Doğrudan Temin Onay Belgesi (DOCX) içinden DT numarası (ve istenirse işin adı) okunur. Fatura tarihi, no, firma ve tutar tek bir fatura PDF'inden birlikte doldurulur. Sonuçlar sarı işaretlenir, kullanıcı kontrol edip kaydeder; hiçbir şey onaysız kaydedilmez. |
+| **Kategori** | Her kayıt bir kategoriye bağlanır (kamyon kiralama, akaryakıt, HGS vb.); Excel çıktısında kategori başına bir sayfa oluşur. |
 | **Çok sayfalı belge desteği** | 10-20 sayfalık taramada **fatura sayfasını otomatik bulur** (sayfa puanlama); yanlışsa "Fatura sayfası" kutusuna `7` ya da `7-8` yazılır. |
 | **Taranmış (resim) PDF'ler** | Windows'un yerleşik OCR motoru ile okunur; ek program kurmak gerekmez. |
 | **Evrak yönetimi** | Faturaya talep, yazı, teklif, irsaliye gibi ekler bağlanır; faturaya çift tıklayınca hepsi listelenir, tek tuşla açılır. |
 | **Arama ve filtre** | Yıl / ay / firma / tarih aralığı / serbest arama; aylık özet penceresi. |
-| **Excel çıktısı** | Biçimlendirilmiş `.xlsx`: gerçek tarih ve sayı hücreleri, toplam satırı, filtre, sabit başlık, yazdırma ayarı, tıklanabilir PDF bağlantıları. CSV de desteklenir. |
+| **Excel çıktısı** | Kategori başına sayfalı, biçimlendirilmiş `.xlsx`: gerçek tarih ve sayı hücreleri, toplam satırı, filtre, sabit başlık, yazdırma ayarı, tıklanabilir PDF bağlantıları. CSV de desteklenir. |
 | **Mükerrer koruması** | Aynı firma + fatura no veya aynı PDF ikinci kez kaydedilemez. |
 | **Modern arayüz** | Açık / Koyu / Mavi tema, zebra satırlar, uygulama ikonu. |
 
