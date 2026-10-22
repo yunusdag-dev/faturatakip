@@ -38,7 +38,7 @@ Alış faturalarını kaydetmek, her faturada firma / numara / tarih / tutarı e
 | **Arama ve filtre** | Yıl / ay / firma / tarih aralığı / serbest arama; aylık özet penceresi. |
 | **Excel çıktısı** | Kategori başına sayfalı, biçimlendirilmiş `.xlsx`: gerçek tarih ve sayı hücreleri, toplam satırı, filtre, sabit başlık, yazdırma ayarı, tıklanabilir PDF bağlantıları. CSV de desteklenir. |
 | **Mükerrer koruması** | Aynı firma + fatura no veya aynı PDF ikinci kez kaydedilemez. |
-| **Modern arayüz** | Açık / Koyu / Mavi tema, zebra satırlar, uygulama ikonu. |
+| **Modern arayüz** | Açık / Koyu / Mavi / Yeşil / Mor / Turuncu / Kırmızı tema, zebra satırlar, uygulama ikonu. |
 
 <div align="center">
 <img src="docs/ekran-koyu.png" width="880" alt="Koyu tema">
@@ -80,6 +80,22 @@ Kod tek dosyada (yaklaşık 2.500 satır) ve katmanlı: ayarlar → yardımcıla
 4. Diğer bilgisayarlarda `\\SUNUCU-PC\FaturaTakip\Program\FaturaTakip.exe` için kısayol oluşturun.
 5. **Güncelleme:** herkes programı kapattıktan sonra yeni dosyaları `Program`'a kopyalayın; `config.ini` ve `Veri`'ye dokunmayın.
 6. `Veri\fatura.db` dosyasını düzenli yedekleyin.
+7. **İlk açılış (yönetici hesabı):** Kısayolları dağıtmadan önce uygulamayı **kendi bilgisayarınızdan bir kez açın**.
+   Veritabanında hesap yoksa "İlk Kurulum" ekranı çıkar; yönetici hesabını oluşturun (bu ekran bir daha çıkmaz).
+   Diğer kişileri **Dosya > Kullanıcılar** bölümünden ekleyin: kullanıcı adı + geçici şifre verirsiniz, kişi ilk
+   girişte kendi şifresini belirler. Hesaplar `fatura.db` içinde (şifreler tuzlu hash olarak) tutulur.
+
+**Hesaplar ve yetkiler**
+
+| | Yönetici | Kullanıcı |
+|---|---|---|
+| Kayıt ekleme / düzenleme, evrak, Excel çıktısı | ✔ | ✔ |
+| Fatura silme | ✔ | ✘ |
+| Kullanıcı ekleme, şifre sıfırlama, pasife alma, yönetici atama | ✔ | ✘ |
+
+- "Beni bu bilgisayarda hatırla" (90 gün geçerli) yalnızca o kişinin Windows profilinde rastgele bir anahtar saklar; başkasının bilgisayarında işaretlemeyin. **Dosya > Oturumu Kapat** bu kaydı siler.
+- **Yönetici şifresi unutulursa:** veritabanı dosyasına erişimi olan biri Python ile `python fatura_takip.py --yonetici-sifirla` komutunu çalıştırıp yeni yönetici şifresi belirleyebilir.
+- Bu yapı güvenlik değil **hesap verebilirlik** sağlar (kim ne ekledi görünür). Veritabanı ortak klasörde bir dosya olduğundan, klasöre erişimi olan biri uygulamayı atlayabilir; asıl koruma için klasörün Windows izinlerini kısıtlayın.
 
 Taranmış PDF'ler için Windows'ta **Türkçe OCR dil paketi** kurulu olmalıdır.
 
@@ -102,7 +118,7 @@ Exe üretmek için bir kez `pip install pyinstaller` yapın, ardından [derle.ba
 |---|---|
 | `veritabani` | Veritabanı yolu (ağ için UNC; sürücü harfi kullanmayın) |
 | `tarama_klasoru` | PDF "Gözat" penceresinin ilk klasörü |
-| `tema` | Açık / Koyu / Mavi |
+| `tema` | Açık / Koyu / Mavi / Yeşil / Mor / Turuncu / Kırmızı |
 | `kurum_anahtar` | Kendi kurumunuzun adından kelimeler; PDF'te alıcıyı firma sanmasın diye |
 | `kurum_vkn` | Kendi kurumunuzun vergi numarası |
 

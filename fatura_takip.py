@@ -11,7 +11,7 @@ Ayarlar: Programla aynı klasördeki config.ini dosyası.
   [ayarlar]
   veritabani = fatura.db                     ; ağ için: \\sunucu\paylasim\FaturaTakip\fatura.db
   tarama_klasoru =                           ; PDF "Gözat" penceresinin ilk açılacağı klasör (isteğe bağlı)
-  tema = Açık                                ; Açık / Koyu / Mavi (menüden de değiştirilir)
+  tema = Açık                                ; Açık / Koyu / Mavi / Yeşil / Mor / Turuncu / Kırmızı (menüden de değiştirilir)
   kurum_anahtar =                            ; kendi kurumunuzun adından kelime(ler), virgülle (PDF'te alıcıyı firma sanmasın)
   kurum_vkn =                                ; kendi kurumunuzun vergi numarası (isteğe bağlı)
 
@@ -21,8 +21,12 @@ Tutarlar veritabanında KURUŞ (tam sayı) olarak tutulur; böylece yuvarlama ha
 import configparser
 import csv
 import getpass
+import hashlib
+import hmac
+import json
 import os
 import re
+import secrets
 import sqlite3
 import base64
 import shutil
@@ -30,10 +34,11 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import zipfile
 import zlib
 import xml.etree.ElementTree as ET
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 # İsteğe bağlı: PyMuPDF kuruluysa PDF metni onunla okunur (daha güvenilir). Yoksa program
@@ -202,8 +207,71 @@ class MukerrerKayit(VeritabaniHatasi):
     pass
 
 
+# ---- kullanıcı hesapları: şifre hash'leme ve "beni hatırla" oturum dosyası ---------------------
+SIFRE_EN_AZ = 6
+OTURUM_GUN = 90                       # "beni hatırla" anahtarının geçerlilik süresi
+_PBKDF2_TUR = 200_000
+_SIFRE_HARFLERI = "abcdefghjkmnpqrstuvwxyz23456789"       # 0/O, 1/l/I gibi karışanlar yok
+
+
+def sifre_hashle(sifre):
+    """'pbkdf2$tur$tuz$hash' biçiminde tuzlu hash üretir (düz şifre hiçbir yerde saklanmaz)."""
+    tuz = secrets.token_bytes(16)
+    h = hashlib.pbkdf2_hmac("sha256", sifre.encode("utf-8"), tuz, _PBKDF2_TUR)
+    return "pbkdf2$%d$%s$%s" % (_PBKDF2_TUR, tuz.hex(), h.hex())
+
+
+def sifre_dogru_mu(sifre, kayit):
+    try:
+        _, tur, tuz, h = (kayit or "").split("$")
+        beklenen = hashlib.pbkdf2_hmac("sha256", sifre.encode("utf-8"), bytes.fromhex(tuz), int(tur))
+    except ValueError:
+        return False
+    return hmac.compare_digest(beklenen.hex(), h)
+
+
+def gecici_sifre(uzunluk=8):
+    return "".join(secrets.choice(_SIFRE_HARFLERI) for _ in range(uzunluk))
+
+
+def _oturum_dosyasi():
+    klasor = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "FaturaTakip")
+    return os.path.join(klasor, "oturum.json")
+
+
+def oturum_oku(db_yolu):
+    """Bu bilgisayarda bu veritabanı için saklanan 'beni hatırla' anahtarı ('' = yok)."""
+    try:
+        with open(_oturum_dosyasi(), encoding="utf-8") as f:
+            return str(json.load(f).get(yol_norm(db_yolu), ""))
+    except (OSError, ValueError, AttributeError):
+        return ""
+
+
+def oturum_yaz(db_yolu, token):
+    """Anahtarı bu bilgisayarın kullanıcı profiline yazar; token boşsa kaydı siler. Hata sessizce yutulur."""
+    dosya = _oturum_dosyasi()
+    try:
+        try:
+            with open(dosya, encoding="utf-8") as f:
+                veri = json.load(f)
+        except (OSError, ValueError):
+            veri = {}
+        if not isinstance(veri, dict):
+            veri = {}
+        if token:
+            veri[yol_norm(db_yolu)] = token
+        else:
+            veri.pop(yol_norm(db_yolu), None)
+        os.makedirs(os.path.dirname(dosya), exist_ok=True)
+        with open(dosya, "w", encoding="utf-8") as f:
+            json.dump(veri, f)
+    except OSError:
+        pass
+
+
 ALANLAR = ["fatura_tarihi", "fatura_no", "firma_adi", "yapilan_is",
-           "tutar_haric", "tutar_dahil", "pdf_yolu", "kategori", "talep_no", "talep_tarihi", "dt_no"]
+           "tutar_haric", "tutar_dahil", "pdf_yolu", "kategori", "talep_no", "talep_tarihi", "dt_no", "talep_eden_birim"]
 
 # Yeni Kayıt formundaki kategori listesi ve Excel çıktısındaki sayfa adları (Faturalar 2026.xlsx ile aynı)
 KATEGORILER = ["Minibüs-Otobüs Kiralama", "Kamyon Kiralama", "İş Makinesi Kiralama", "Asansör Bakım Onarım",
@@ -271,7 +339,7 @@ class FaturaDB:
             sutunlar = [r[1] for r in con.execute("PRAGMA table_info(faturalar)")]
             if "vkn" not in sutunlar:
                 con.execute("ALTER TABLE faturalar ADD COLUMN vkn TEXT")
-            for yeni in ("kategori", "talep_no", "talep_tarihi", "dt_no"):
+            for yeni in ("kategori", "talep_no", "talep_tarihi", "dt_no", "talep_eden_birim"):
                 if yeni not in sutunlar:
                     con.execute("ALTER TABLE faturalar ADD COLUMN %s TEXT" % yeni)
             con.execute("CREATE TABLE IF NOT EXISTS firma_vkn (vkn TEXT PRIMARY KEY, firma_adi TEXT NOT NULL)")
@@ -286,7 +354,145 @@ class FaturaDB:
                     ekleme_tarihi TEXT
                 )""")
             con.execute("CREATE INDEX IF NOT EXISTS ix_ek_fatura ON ekler(fatura_id)")
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS kullanicilar (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    kullanici_adi TEXT NOT NULL,
+                    kullanici_anahtar TEXT NOT NULL UNIQUE,
+                    sifre TEXT NOT NULL,
+                    yonetici INTEGER NOT NULL DEFAULT 0,
+                    aktif INTEGER NOT NULL DEFAULT 1,
+                    sifre_degismeli INTEGER NOT NULL DEFAULT 0,
+                    olusturma_tarihi TEXT
+                )""")
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS oturumlar (
+                    anahtar_hash TEXT PRIMARY KEY,
+                    kullanici_id INTEGER NOT NULL,
+                    olusturma_tarihi TEXT
+                )""")
         self._calistir(f)
+
+    # -- kullanıcı hesapları -------------------------------------------------
+    @staticmethod
+    def _sifre_kontrol(sifre):
+        if len(sifre or "") < SIFRE_EN_AZ:
+            raise VeritabaniHatasi("Şifre en az %d karakter olmalı." % SIFRE_EN_AZ)
+
+    def kullanici_sayisi(self):
+        return self._calistir(lambda con: con.execute("SELECT COUNT(*) FROM kullanicilar").fetchone()[0])
+
+    def kullanicilar(self):
+        def f(con):
+            return [dict(r) for r in con.execute(
+                "SELECT id, kullanici_adi, yonetici, aktif, sifre_degismeli FROM kullanicilar "
+                "ORDER BY kullanici_anahtar")]
+        return self._calistir(f)
+
+    def _kullanici_ekle(self, con, ad, sifre, yonetici, sifre_degismeli):
+        ad = (ad or "").strip()
+        if not ad:
+            raise VeritabaniHatasi("Kullanıcı adı boş olamaz.")
+        self._sifre_kontrol(sifre)
+        if con.execute("SELECT 1 FROM kullanicilar WHERE kullanici_anahtar=?", (tr_kucuk(ad),)).fetchone():
+            raise MukerrerKayit("'%s' adlı bir kullanıcı zaten var." % ad)
+        con.execute("INSERT INTO kullanicilar (kullanici_adi, kullanici_anahtar, sifre, yonetici, aktif, "
+                    "sifre_degismeli, olusturma_tarihi) VALUES (?,?,?,?,1,?,?)",
+                    (ad, tr_kucuk(ad), sifre_hashle(sifre), 1 if yonetici else 0, 1 if sifre_degismeli else 0,
+                     datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+
+    def kullanici_ekle(self, ad, sifre, yonetici=False, sifre_degismeli=True):
+        self._calistir(lambda con: self._kullanici_ekle(con, ad, sifre, yonetici, sifre_degismeli))
+
+    def ilk_yonetici_olustur(self, ad, sifre):
+        """Yalnızca hiç hesap yokken çalışır (aynı anda iki kişi açarsa ikincisi reddedilir)."""
+        def f(con):
+            if con.execute("SELECT COUNT(*) FROM kullanicilar").fetchone()[0]:
+                raise VeritabaniHatasi("Yönetici hesabı başka biri tarafından az önce oluşturuldu.\n"
+                                       "Uygulamayı yeniden açıp kendi hesabınızla giriş yapın.")
+            self._kullanici_ekle(con, ad, sifre, True, False)
+        self._calistir(f)
+
+    def giris_dene(self, ad, sifre):
+        """-> (kayıt | None, hata metni). Pasif hesabın durumu yalnızca şifre doğruysa söylenir."""
+        def f(con):
+            r = con.execute("SELECT * FROM kullanicilar WHERE kullanici_anahtar=?", (tr_kucuk(ad),)).fetchone()
+            if not r or not sifre_dogru_mu(sifre, r["sifre"]):
+                return None, "Kullanıcı adı veya şifre hatalı."
+            if not r["aktif"]:
+                return None, "Bu hesap pasife alınmış. Yöneticinize başvurun."
+            return dict(r), ""
+        return self._calistir(f)
+
+    def sifre_degistir(self, kid, yeni, eski=None):
+        """eski verilirse mevcut şifre doğrulanır. Kullanıcı kendi şifresini seçtiği için 'değiştirmeli' bayrağı kalkar."""
+        self._sifre_kontrol(yeni)
+
+        def f(con):
+            r = con.execute("SELECT sifre FROM kullanicilar WHERE id=?", (kid,)).fetchone()
+            if not r:
+                raise VeritabaniHatasi("Kullanıcı bulunamadı.")
+            if eski is not None and not sifre_dogru_mu(eski, r["sifre"]):
+                raise VeritabaniHatasi("Mevcut şifre hatalı.")
+            con.execute("UPDATE kullanicilar SET sifre=?, sifre_degismeli=0 WHERE id=?", (sifre_hashle(yeni), kid))
+        self._calistir(f)
+
+    def sifre_sifirla(self, kid, gecici):
+        """Yönetici işlemi: geçici şifre verir, ilk girişte değiştirtir, kullanıcının 'hatırla' oturumlarını düşürür."""
+        self._sifre_kontrol(gecici)
+
+        def f(con):
+            con.execute("UPDATE kullanicilar SET sifre=?, sifre_degismeli=1 WHERE id=?", (sifre_hashle(gecici), kid))
+            con.execute("DELETE FROM oturumlar WHERE kullanici_id=?", (kid,))
+        self._calistir(f)
+
+    def kullanici_durumu(self, kid, aktif=None, yonetici=None):
+        """Aktif/yönetici bayrağını değiştirir; en az bir aktif yönetici her zaman kalır."""
+        def f(con):
+            if aktif is not None:
+                con.execute("UPDATE kullanicilar SET aktif=? WHERE id=?", (1 if aktif else 0, kid))
+                if not aktif:
+                    con.execute("DELETE FROM oturumlar WHERE kullanici_id=?", (kid,))
+            if yonetici is not None:
+                con.execute("UPDATE kullanicilar SET yonetici=? WHERE id=?", (1 if yonetici else 0, kid))
+            if not con.execute("SELECT 1 FROM kullanicilar WHERE yonetici=1 AND aktif=1").fetchone():
+                raise VeritabaniHatasi("En az bir aktif yönetici kalmalı.")
+        self._calistir(f)
+
+    def yonetici_kurtar(self, ad, sifre):
+        """Komut satırı kurtarması: hesabı yoksa açar; varsa yönetici + aktif yapıp şifresini yeniler."""
+        def f(con):
+            if con.execute("SELECT 1 FROM kullanicilar WHERE kullanici_anahtar=?", (tr_kucuk(ad),)).fetchone():
+                self._sifre_kontrol(sifre)
+                con.execute("UPDATE kullanicilar SET sifre=?, yonetici=1, aktif=1, sifre_degismeli=0 "
+                            "WHERE kullanici_anahtar=?", (sifre_hashle(sifre), tr_kucuk(ad)))
+            else:
+                self._kullanici_ekle(con, ad, sifre, True, False)
+        self._calistir(f)
+
+    # "Beni hatırla": bilgisayarda yalnızca rastgele bir anahtar durur; veritabanında yalnızca onun hash'i
+    def oturum_olustur(self, kid):
+        token = secrets.token_urlsafe(32)
+        self._calistir(lambda con: con.execute(
+            "INSERT INTO oturumlar (anahtar_hash, kullanici_id, olusturma_tarihi) VALUES (?,?,?)",
+            (hashlib.sha256(token.encode()).hexdigest(), kid, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))))
+        return token
+
+    def oturum_dogrula(self, token):
+        """'Beni hatırla' anahtarı OTURUM_GUN günden eskiyse geçersizdir (süresi dolanlar silinir)."""
+        sinir = (datetime.now() - timedelta(days=OTURUM_GUN)).strftime("%Y-%m-%d %H:%M:%S")
+
+        def f(con):
+            con.execute("DELETE FROM oturumlar WHERE olusturma_tarihi < ?", (sinir,))
+            r = con.execute("SELECT k.* FROM oturumlar o JOIN kullanicilar k ON k.id = o.kullanici_id "
+                            "WHERE o.anahtar_hash=? AND k.aktif=1",
+                            (hashlib.sha256((token or "").encode()).hexdigest(),)).fetchone()
+            return dict(r) if r else None
+        return self._calistir(f)
+
+    def oturum_kapat(self, token):
+        self._calistir(lambda con: con.execute("DELETE FROM oturumlar WHERE anahtar_hash=?",
+                                               (hashlib.sha256((token or "").encode()).hexdigest(),)))
 
     # -- kontroller ----------------------------------------------------------
     @staticmethod
@@ -317,12 +523,13 @@ class FaturaDB:
             cur = con.execute("""
                 INSERT INTO faturalar (fatura_tarihi, fatura_no, firma_adi, yapilan_is, tutar_haric,
                     tutar_dahil, pdf_yolu, kaydeden, kayit_tarihi, firma_anahtar, pdf_anahtar, vkn, kategori,
-                    talep_no, talep_tarihi, dt_no)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    talep_no, talep_tarihi, dt_no, talep_eden_birim)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (veri["fatura_tarihi"], veri["fatura_no"], veri["firma_adi"], veri["yapilan_is"],
                  veri["tutar_haric"], veri.get("tutar_dahil"), veri["pdf_yolu"], kullanici, simdi,
                  self._anahtar_firma(veri), yol_norm(veri.get("pdf_yolu")), veri.get("vkn") or None,
-                 veri.get("kategori") or None, veri.get("talep_no"), veri.get("talep_tarihi"), veri.get("dt_no")))
+                 veri.get("kategori") or None, veri.get("talep_no"), veri.get("talep_tarihi"), veri.get("dt_no"),
+                 veri.get("talep_eden_birim")))
             self._vkn_isle(con, veri)
             return cur.lastrowid
         return self._calistir(f)
@@ -336,11 +543,12 @@ class FaturaDB:
                 UPDATE faturalar SET fatura_tarihi=?, fatura_no=?, firma_adi=?, yapilan_is=?,
                     tutar_haric=?, pdf_yolu=?, son_duzenleyen=?, duzenleme_tarihi=?,
                     firma_anahtar=?, pdf_anahtar=?, vkn=COALESCE(NULLIF(?, ''), vkn), kategori=?,
-                    talep_no=?, talep_tarihi=?, dt_no=? WHERE id=?""",
+                    talep_no=?, talep_tarihi=?, dt_no=?, talep_eden_birim=? WHERE id=?""",
                 (veri["fatura_tarihi"], veri["fatura_no"], veri["firma_adi"], veri["yapilan_is"],
                  veri["tutar_haric"], veri["pdf_yolu"], kullanici, simdi,
                  self._anahtar_firma(veri), yol_norm(veri.get("pdf_yolu")), veri.get("vkn") or "", veri.get("kategori") or None,
-                 veri.get("talep_no"), veri.get("talep_tarihi"), veri.get("dt_no"), fid))
+                 veri.get("talep_no"), veri.get("talep_tarihi"), veri.get("dt_no"),
+                 veri.get("talep_eden_birim"), fid))
             self._vkn_isle(con, veri)
         self._calistir(f)
 
@@ -439,7 +647,8 @@ def filtrele(satirlar, arama="", firma="", bas=None, bit=None, yil=None, ay=None
             continue
         if a:
             havuz = tr_kucuk(" ".join([r["fatura_no"] or "", r["firma_adi"] or "", r["yapilan_is"] or "",
-                                    r.get("kategori") or "", r.get("talep_no") or "", r.get("dt_no") or ""]))
+                                    r.get("kategori") or "", r.get("talep_no") or "", r.get("dt_no") or "",
+                                    r.get("talep_eden_birim") or ""]))
             if a not in havuz:
                 continue
         sonuc.append(r)
@@ -502,9 +711,9 @@ def xlsx_yaz(yol, satirlar, baslik="Alış Faturaları"):
 
 def _kategori_sayfasi_yaz(ws, satirlar, baslik, st):
     from openpyxl.utils import get_column_letter
-    sutunlar = ["Fatura Tarihi", "Fatura No", "Firma Adı", "Yapılan İş", "Tutar (KDV Hariç)", "Talep No", "Ek Evrak",
-                "PDF Konumu"]
-    genislik_en_az = [14, 20, 34, 40, 18, 12, 10, 40]
+    sutunlar = ["Fatura Tarihi", "Fatura No", "Firma Adı", "Yapılan İş", "Tutar (KDV Hariç)", "Talep No",
+                "Talep Eden Birim", "Ek Evrak", "PDF Konumu"]
+    genislik_en_az = [14, 20, 34, 40, 18, 12, 40, 10, 40]
     son = len(sutunlar)
 
     ws["A1"] = "%s   (%d fatura, düzenlenme: %s)" % (baslik, len(satirlar), date.today().strftime("%d.%m.%Y"))
@@ -527,7 +736,8 @@ def _kategori_sayfasi_yaz(ws, satirlar, baslik, st):
             tarih = r["fatura_tarihi"]
         haric = r["tutar_haric"] / 100 if r["tutar_haric"] is not None else None
         degerler = [tarih, r["fatura_no"], r["firma_adi"], r["yapilan_is"] or "", haric,
-                    r.get("talep_no") or "", r.get("ek_sayisi") or None, r["pdf_yolu"] or ""]
+                    r.get("talep_no") or "", r.get("talep_eden_birim") or "", r.get("ek_sayisi") or None,
+                    r["pdf_yolu"] or ""]
         for k, d in enumerate(degerler, 1):
             c = ws.cell(row=sat, column=k, value=d)
             if isinstance(d, str) and d.startswith("="):
@@ -539,17 +749,18 @@ def _kategori_sayfasi_yaz(ws, satirlar, baslik, st):
                 c.number_format, c.alignment = "DD.MM.YYYY", st["orta"]
             elif k == 5:
                 c.number_format, c.alignment = "#,##0.00", st["sag"]
-            elif k in (6, 7):
+            elif k in (6, 8):
                 c.alignment = st["orta"]
             else:
                 c.alignment = st["sol"]
-        pdf = ws.cell(row=sat, column=8)
         if r["pdf_yolu"]:
-            try:
-                pdf.hyperlink = r["pdf_yolu"]
-                pdf.font = openpyxl.styles.Font(name="Calibri", size=11, color="0563C1", underline="single")
-            except Exception:
-                pass
+            for sutun in (2, 9):                # Fatura No ve PDF Konumu hücreleri faturanın PDF'ini açar
+                try:
+                    hucre = ws.cell(row=sat, column=sutun)
+                    hucre.hyperlink = r["pdf_yolu"]
+                    hucre.font = openpyxl.styles.Font(name="Calibri", size=11, color="0563C1", underline="single")
+                except Exception:
+                    pass
 
     ilk, bit = bas + 1, bas + len(sirali)
     tr = bit + 1
@@ -559,11 +770,11 @@ def _kategori_sayfasi_yaz(ws, satirlar, baslik, st):
     ws.cell(row=tr, column=3, value="TOPLAM (%d fatura)" % len(sirali)).alignment = st["sag"]
     c = ws.cell(row=tr, column=5, value="=SUBTOTAL(109,E%d:E%d)" % (ilk, bit))
     c.number_format, c.alignment = "#,##0.00", st["sag"]
-    ws.cell(row=tr, column=7, value="=SUBTOTAL(109,G%d:G%d)" % (ilk, bit)).alignment = st["orta"]
+    ws.cell(row=tr, column=8, value="=SUBTOTAL(109,H%d:H%d)" % (ilk, bit)).alignment = st["orta"]
 
     for k, ad in enumerate(sutunlar, 1):
         en = max([len(str(ws.cell(row=s, column=k).value or "")) for s in range(ilk, bit + 1)] + [len(ad)])
-        sinir = 60 if k in (3, 4, 8) else 24
+        sinir = 60 if k in (3, 4, 7, 9) else 24
         ws.column_dimensions[get_column_letter(k)].width = min(max(genislik_en_az[k - 1], en + 3), sinir)
 
     ws.auto_filter.ref = "A%d:%s%d" % (bas, get_column_letter(son), bit)
@@ -573,6 +784,88 @@ def _kategori_sayfasi_yaz(ws, satirlar, baslik, st):
     ws.page_setup.fitToWidth, ws.page_setup.fitToHeight = 1, 0
     ws.sheet_properties.pageSetUpPr = openpyxl.worksheet.properties.PageSetupProperties(fitToPage=True)
     ws.print_title_rows = "%d:%d" % (bas, bas)
+
+
+SATINALMA_SABLONU = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))),
+                                 "sablon", "satinalma_sablonu.xlsx")
+
+
+def tr_buyuk(metin):
+    """Türkçe büyük harfe çevirme ('Ekim' -> 'EKİM')."""
+    return (metin or "").replace("i", "İ").replace("ı", "I").upper()
+
+
+def _excel_sayisi(metin):
+    """Yalnızca rakamlardan oluşan numaraları (talep no gibi) Excel'de sayı olarak yazmak için int yapar."""
+    m = (metin or "").strip()
+    return int(m) if m.isdigit() and len(m) <= 15 and not m.startswith("0") else m
+
+
+def _iso_tarih(iso):
+    try:
+        return datetime.strptime((iso or "")[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+# Satınalma 'Makine İkmal Harcama Listesi' sütunları  <-  kayıt alanları (başka sütunlar elle doldurulur)
+SATINALMA_SUTUNLARI = (
+    (2, "dt_no"),                                    # B  EKAP doğrudan temin kayıt no
+    (3, "talep_eden_birim"),                         # C  Talep eden birim
+    (4, "talep_no"),                                 # D  Talep no
+    (5, "talep_tarihi"),                             # E  Belgenet tarihi (= talep tarihi)
+    (6, "talep_no"),                                 # F  Belgenet no (= talep no)
+    (7, "yapilan_is"),                               # G  İşin konusu
+    (8, "firma_adi"),                                # H  Kalan firma
+    (9, "fatura_tarihi"),                            # I  Fatura tarihi
+    (10, "fatura_no"),                               # J  Fatura no
+    (11, "tutar_haric"),                             # K  Ödeme tutarı (KDV hariç)
+)
+
+
+def satinalma_xlsx_yaz(yol, satirlar, baslik, sayfa_adi):
+    """Kayıtları satınalma 'Makine İkmal Harcama Listesi' biçiminde yazar: sablon/satinalma_sablonu.xlsx
+    açılır (biçim, sütun genişlikleri, filtre, dondurma aynen korunur), kayıtlar 3. satırdan itibaren doldurulur."""
+    if openpyxl is None:
+        raise RuntimeError("XLSX için 'openpyxl' kütüphanesi kurulu değil.")
+    if not os.path.exists(SATINALMA_SABLONU):
+        raise FileNotFoundError("Satınalma şablonu bulunamadı:\n%s" % SATINALMA_SABLONU)
+    from copy import copy
+    wb = openpyxl.load_workbook(SATINALMA_SABLONU)
+    ws = wb.active
+    ws.title = _xlsx_sayfa_adi(sayfa_adi)
+    ws["A1"] = baslik
+    ilk, son_sutun = 3, 28
+    son = ilk
+    while ws.cell(son + 1, 1).value is not None or ws.cell(son + 2, 1).value is not None:
+        son += 1                                        # şablondaki numaralı/biçimli satırların sonu (1 satır boşluğa dayanıklı)
+    sirali = sorted(satirlar, key=lambda x: (x["fatura_tarihi"] or "", x["id"]))
+    son_yazilan = max(son, ilk + len(sirali) - 1)
+    for sat in range(ilk, son_yazilan + 1):
+        if sat > son:                                   # kayıt sayısı şablondaki satırdan fazlaysa son satırın biçimini çoğalt
+            for k in range(1, son_sutun + 1):
+                ws.cell(sat, k)._style = copy(ws.cell(son, k)._style)
+            ws.row_dimensions[sat].height = ws.row_dimensions[son].height
+        ws.cell(sat, 1).value = sat - ilk + 1           # SIRA NO baştan sıralı
+        for k in range(2, son_sutun + 1):               # şablonda eski veri kalmış olsa bile temizle
+            ws.cell(sat, k).value = None
+    for i, rec in enumerate(sirali):
+        sat = ilk + i
+        for k, alan in SATINALMA_SUTUNLARI:
+            d = rec.get(alan)
+            if alan in ("talep_tarihi", "fatura_tarihi"):
+                d = _iso_tarih(d)
+            elif alan == "tutar_haric":
+                d = d / 100 if d is not None else None
+            elif alan == "talep_no":
+                d = _excel_sayisi(d) if d else None
+            else:
+                d = (d or "").strip() or None
+            c = ws.cell(sat, k, value=d)
+            if isinstance(d, str) and d.startswith("="):
+                c.data_type = "s"                       # PDF/DOCX'ten gelen '=...' metni formül olarak çalışmasın
+    ws.auto_filter.ref = "A2:%s%d" % (openpyxl.utils.get_column_letter(son_sutun), son_yazilan)
+    wb.save(yol)
 
 
 def ozet_xlsx_yaz(yol, ozet, yil):
@@ -634,12 +927,12 @@ def csv_yaz(yol, satirlar):
     with open(yol, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f, delimiter=";")
         w.writerow(["Fatura Tarihi", "Fatura No", "Firma Adı", "Yapılan İş", "Kategori",
-                    "Fatura Tutarı (KDV Hariç)", "Talep No", "PDF Konumu"])
+                    "Fatura Tutarı (KDV Hariç)", "Talep No", "Talep Eden Birim", "PDF Konumu"])
         for r in satirlar:
             w.writerow([tarih_yaz(r["fatura_tarihi"])] + [_csv_guvenli(x) for x in (
                 r["fatura_no"], r["firma_adi"], r["yapilan_is"] or "", r.get("kategori") or "")]
                 + [tutar_yaz(r["tutar_haric"])] + [_csv_guvenli(x) for x in (
-                    r.get("talep_no") or "", r["pdf_yolu"] or "")])
+                    r.get("talep_no") or "", r.get("talep_eden_birim") or "", r["pdf_yolu"] or "")])
 
 
 # ----------------------------------------------------------------------------
@@ -1709,8 +2002,11 @@ _TARIH_DESENI = r"\b\d{1,2}[./]\d{1,2}[./]\d{4}\b"
 
 def talep_coz(metin):
     """Talep yazısından (no, tarih_iso, uyarı) çıkarır.
+    Belgede 'Talep Formu' ('Mal Alımı Talep Formu' dahil) yazmıyorsa hiçbir şey okunmaz.
     No: 'Sayı' satırındaki numaranın son 7 rakamı. Tarih: 'Sayı' satırından önceki (sayfanın sağ üstündeki) tarih."""
     metin = (metin or "").replace("\xa0", " ")
+    if "talep formu" not in tr_kucuk(metin):
+        return None, None, "Bu belge 'Talep Formu' ya da 'Mal Alımı Talep Formu' değil; talep no ve tarihi okunmadı."
     no = tarih = None
     m = re.search(r"Say[ıiİI]\s*:\s*(\S+)", metin)
     if m:
@@ -1725,8 +2021,6 @@ def talep_coz(metin):
     uyari = ""
     if not no:
         uyari = "'Sayı' satırı bulunamadı."
-    elif "talep formu" not in tr_kucuk(metin):
-        uyari = "Bu belge 'Talep Formu' gibi görünmüyor (İhtiyaç Formu olabilir); sayı yine de okundu."
     return no, tarih, uyari
 
 
@@ -1749,6 +2043,34 @@ def kural_talep_pdf(yol, secenek):
     if not no and not tarih:
         return None, uyari or "Talep bilgisi okunamadı."
     return talep_yaz(no, tarih), uyari
+
+
+# Talep Eden Birim okunabilmesi için belgede (ilk sayfada) bunlardan biri geçmeli; boşluk sayısı önemsiz.
+BIRIM_ANAHTARLARI = ("Talep Formu", "Malzeme Talep Formu", "Hizmet İhtiyaç Formu", "Malzeme İhtiyaç Formu")
+
+
+def birim_coz(metin):
+    """Belgenin ilk sayfasından talep eden birimi çıkarır -> (birim | None, uyarı).
+    Belgede BIRIM_ANAHTARLARI'ndan biri geçmeli; yoksa hiçbir şey okunmaz (yanlış PDF seçilmiş olabilir). Birim her zaman sayfanın en üstündeki 4. satırdır:
+        T.C.  /  TÜRKİYE ELEKTRİK İLETİM A.Ş. GENEL MÜDÜRLÜĞÜ  /  3.Bölge Müdürlüğü (İzmir)  /  <BİRİM>"""
+    ham = (metin or "").replace("\xa0", " ")
+    k = tr_kucuk(ham)
+    if not any(a in " ".join(k.split()) for a in map(tr_kucuk, BIRIM_ANAHTARLARI)):
+        return None, "Belgede %s ifadelerinden biri geçmiyor; birim okunmadı." % ", ".join(
+            "'%s'" % a for a in BIRIM_ANAHTARLARI)
+    satirlar = [s.strip() for s in ham.splitlines() if s.strip()]
+    bas = 0                                            # 'T.C.' satırı 1. satır; bulunamazsa sayfanın ilk satırı
+    for i, s in enumerate(satirlar[:6]):
+        if re.fullmatch(r"t\.?\s?c\.?", tr_kucuk(s)):
+            bas = i
+            break
+    if bas + 3 >= len(satirlar):
+        return None, "Sayfanın üstündeki 4. satır (talep eden birim) bulunamadı."
+    return " ".join(satirlar[bas + 3].split()), ""
+
+
+def kural_birim_pdf(yol, secenek):
+    return birim_coz(_ilk_sayfa_metni(yol))
 
 
 _IS_BASLIK_ONEKI = re.compile(r"^(hizmet|malzeme)", re.I)
@@ -1840,9 +2162,26 @@ def is_adi_pdf_metinden(metin):
     return None
 
 
+_SONDAKI_PARANTEZ = re.compile(r"\s*\([^()]*\)\s*$")
+
+
+def is_adi_parantez_at(ad):
+    """İşin adının sonundaki parantez içi kısımları atar: 'Sepetli Vinç Kiralama (1 Adet) (Gölmarmara)' ->
+    'Sepetli Vinç Kiralama'. Ortadaki parantezlere dokunmaz; ad yalnızca parantezden oluşuyorsa olduğu gibi kalır."""
+    sade = ad or ""
+    while _SONDAKI_PARANTEZ.search(sade):
+        sade = _SONDAKI_PARANTEZ.sub("", sade)
+    return sade or ad
+
+
 def kural_is_adi_pdf(yol, secenek):
-    deger = is_adi_pdf_tablodan(yol) or is_adi_pdf_metinden(_ilk_sayfa_metni(yol))
-    return deger, ("" if deger else "PDF'te 'Hizmetin / Malzemenin adı ve karakteristiği' başlığı bulunamadı.")
+    metin = _ilk_sayfa_metni(yol)
+    if "talep formu" not in tr_kucuk(metin):          # 'Talep Formu' ve 'Mal Alımı Talep Formu' ikisini de kapsar
+        return None, "Bu belge 'Talep Formu' ya da 'Mal Alımı Talep Formu' değil; işin adı okunmadı."
+    deger = is_adi_pdf_tablodan(yol) or is_adi_pdf_metinden(metin)
+    if not deger:
+        return None, "PDF'te 'Hizmetin / Malzemenin adı ve karakteristiği' başlığı bulunamadı."
+    return is_adi_parantez_at(deger), ""
 
 
 OKUMA_KURALLARI = {
@@ -1850,6 +2189,7 @@ OKUMA_KURALLARI = {
     ("is", ".docx"): kural_docx_etiket("İşin Adı"),
     ("dt", ".docx"): kural_docx_etiket("Doğrudan Temin Numarası", r"\b\d{2}DT\d{5,}\b"),
     ("talep", ".pdf"): kural_talep_pdf,
+    ("birim", ".pdf"): kural_birim_pdf,
 }
 OKUNABILIR_TURLER = (".pdf", ".docx")
 
@@ -1898,7 +2238,34 @@ TEMALAR = {
     "Mavi": dict(bg="#e8f0fa", fg="#12263f", alan="#ffffff", sec="#1f5fae", sec_fg="#ffffff",
                  baslik="#c9dcf2", oto="#fff0b3", cizgi="#a9c3e3", dugme="#d3e3f6", zebra="#f0f6fd",
                  **{"not": "#4a6a8f"}),
+    "Yeşil": dict(bg="#e9f4ec", fg="#14301e", alan="#ffffff", sec="#2e7d4f", sec_fg="#ffffff",
+                  baslik="#cde6d5", oto="#fff0b3", cizgi="#a8cdb4", dugme="#d5ebdc", zebra="#f1f9f4",
+                  **{"not": "#4c7058"}),
+    "Mor": dict(bg="#f0eaf8", fg="#26183d", alan="#ffffff", sec="#6b3fa0", sec_fg="#ffffff",
+                baslik="#dccdef", oto="#fff0b3", cizgi="#c3add8", dugme="#e4d9f2", zebra="#f7f3fc",
+                **{"not": "#6d5a8a"}),
+    "Turuncu": dict(bg="#fdf1e6", fg="#3a2210", alan="#ffffff", sec="#d9660b", sec_fg="#ffffff",
+                    baslik="#f6dcc2", oto="#fff0b3", cizgi="#e8c4a0", dugme="#f9e3cd", zebra="#fef8f2",
+                    **{"not": "#8a6240"}),
+    "Kırmızı": dict(bg="#faebeb", fg="#3a1414", alan="#ffffff", sec="#b3261e", sec_fg="#ffffff",
+                    baslik="#f1cccc", oto="#fff0b3", cizgi="#e0aaaa", dugme="#f6d7d7", zebra="#fdf4f4",
+                    **{"not": "#8a4f4f"}),
 }
+
+
+UYGULAMA_KIMLIGI = "YunusDag.FaturaTakip"
+
+
+def windows_kimligi_ayarla():
+    """Windows'a bu sürecin kendi uygulaması olduğunu bildirir (AppUserModelID). Bu olmadan 'python fatura_takip.py'
+    ile açıldığında görev çubuğu pencereyi python.exe'ye bağlar: Python ikonu görünür, alt-tab ve gruplama bozulur."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(UYGULAMA_KIMLIGI)
+    except Exception:
+        pass
 
 
 def arayuzu_calistir():
@@ -1908,12 +2275,15 @@ def arayuzu_calistir():
     ayar = ayarlari_oku()
     kullanici = getpass.getuser()
 
+    windows_kimligi_ayarla()                       # pencere açılmadan ÖNCE: görev çubuğu Python'u değil uygulamayı görsün
     kok = tk.Tk()
     kok.title(UYGULAMA_ADI)
     kok.geometry("1240x680")
     kok.minsize(980, 520)
+    kok.withdraw()                                 # giriş yapılana kadar ana pencere görünmez
     try:
-        kok.iconbitmap(default=IKON_YOLU)          # tüm pencerelerde uygulama ikonu
+        kok.iconbitmap(IKON_YOLU)                  # ana pencerenin görev çubuğu / alt-tab ikonu
+        kok.iconbitmap(default=IKON_YOLU)          # sonradan açılan tüm pencerelerde de aynı ikon
     except tk.TclError:
         pass
 
@@ -2027,6 +2397,152 @@ def arayuzu_calistir():
     def hata_goster(e):
         messagebox.showerror(UYGULAMA_ADI, str(e), parent=kok)
 
+    # ---- hesaplar: giriş, şifre, kullanıcı yönetimi ------------------------------
+    oturum = {"id": None, "ad": "", "yonetici": False, "token": "", "yeniden": False}
+
+    def diyalog(baslik, aciklama, alanlar, tamam="Tamam", onay=None, kontrol=None, ana=None):
+        """Küçük modal form. alanlar: [(etiket, gizli_mi, ilk_deger)]; onay: onay kutusunun metni.
+        kontrol(degerler, onay_isaretli) -> hata metni | None  (hata varsa pencere açık kalır).
+        Döner: (degerler, onay_isaretli) ya da vazgeçilirse None."""
+        pen = tk.Toplevel(kok)
+        pen.title(baslik)
+        pen.configure(bg=tema["r"]["bg"])
+        pen.resizable(False, False)
+        if ana is not None:
+            pen.transient(ana)
+        cerceve = ttk.Frame(pen, padding=16)
+        cerceve.pack()
+        sat = 0
+        if aciklama:
+            ttk.Label(cerceve, text=aciklama, wraplength=360, justify="left").grid(
+                row=sat, column=0, columnspan=2, sticky="w", pady=(0, 10))
+            sat += 1
+        degiskenler, girisler = [], []
+        for etiket, gizli, ilk in alanlar:
+            ttk.Label(cerceve, text=etiket).grid(row=sat, column=0, sticky="w", pady=4)
+            v = tk.StringVar(value=ilk)
+            g = ttk.Entry(cerceve, textvariable=v, width=30, show="\u2022" if gizli else "")
+            g.grid(row=sat, column=1, sticky="w", padx=(12, 0), pady=4)
+            degiskenler.append(v)
+            girisler.append(g)
+            sat += 1
+        onay_v = tk.BooleanVar(value=False)
+        if onay:
+            ttk.Checkbutton(cerceve, text=onay, variable=onay_v).grid(
+                row=sat, column=0, columnspan=2, sticky="w", pady=(6, 0))
+            sat += 1
+        hata_v = tk.StringVar()
+        ttk.Label(cerceve, textvariable=hata_v, foreground="#d93025", wraplength=360, justify="left").grid(
+            row=sat, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        sat += 1
+        sonuc = {}
+
+        def onayla(*_):
+            degerler = [v.get() for v in degiskenler]
+            try:
+                hata = kontrol(degerler, onay_v.get()) if kontrol else None
+            except VeritabaniHatasi as ex:
+                hata = str(ex)
+            if hata:
+                hata_v.set(hata)
+                return
+            sonuc["deger"] = (degerler, onay_v.get())
+            pen.destroy()
+        dugme = ttk.Frame(cerceve)
+        dugme.grid(row=sat, column=0, columnspan=2, sticky="e", pady=(12, 0))
+        ttk.Button(dugme, text=tamam, command=onayla).pack(side="left", padx=4)
+        ttk.Button(dugme, text="Vazgeç", command=pen.destroy).pack(side="left", padx=4)
+        pen.bind("<Return>", onayla)
+        pen.bind("<Escape>", lambda e: pen.destroy())
+        pen.update_idletasks()
+        pen.geometry("+%d+%d" % ((pen.winfo_screenwidth() - pen.winfo_reqwidth()) // 2,
+                                 (pen.winfo_screenheight() - pen.winfo_reqheight()) // 3))
+        pen.wait_visibility()
+        pen.grab_set()
+        girisler[0].focus_set()
+        kok.wait_window(pen)
+        return sonuc.get("deger")
+
+    def yeni_sifre_iste(k, zorunlu, eski_iste=False, ana=None):
+        """Yeni şifre ister ve kaydeder. Döner: kaydedildi mi."""
+        alanlar = ([("Mevcut şifre", True, "")] if eski_iste else []) + \
+                  [("Yeni şifre", True, ""), ("Yeni şifre (tekrar)", True, "")]
+
+        def kontrol(d, _onay):
+            if d[-2] != d[-1]:
+                return "Yeni şifreler aynı değil."
+            db.sifre_degistir(k["id"], d[-2], eski=d[0] if eski_iste else None)
+            return None
+        aciklama = ("Geçici şifreyle giriş yaptınız. Devam etmek için kendi şifrenizi belirleyin (en az %d karakter)."
+                    if zorunlu else "Yeni şifreniz en az %d karakter olmalı.") % SIFRE_EN_AZ
+        return diyalog("Şifre Değiştir", aciklama, alanlar, "Kaydet", kontrol=kontrol, ana=ana) is not None
+
+    def ilk_yonetici_olustur():
+        bulunan = {}
+
+        def kontrol(d, _onay):
+            if d[1] != d[2]:
+                return "Şifreler aynı değil."
+            db.ilk_yonetici_olustur(d[0], d[1])
+            bulunan["k"] = db.giris_dene(d[0], d[1])[0]
+            return None
+        diyalog("İlk Kurulum", "Veritabanında henüz hesap yok. Yönetici hesabını şimdi siz oluşturuyorsunuz; "
+                "diğer kullanıcıları sonra Dosya > Kullanıcılar bölümünden ekleyeceksiniz.",
+                [("Kullanıcı adı", False, ""), ("Şifre", True, ""), ("Şifre (tekrar)", True, "")],
+                "Hesabı Oluştur", kontrol=kontrol)
+        return bulunan.get("k")
+
+    def giris_diyalogu():
+        bulunan = {"token": ""}
+        kilit = {"deneme": 0, "bitis": 0.0}
+
+        def kontrol(d, hatirla):
+            kalan = kilit["bitis"] - time.time()
+            if kalan > 0:
+                return "Çok fazla hatalı deneme. %d saniye sonra tekrar deneyin." % (kalan + 1)
+            k, hata = db.giris_dene(d[0].strip(), d[1])
+            if not k:
+                kilit["deneme"] += 1
+                if kilit["deneme"] % 5 == 0:
+                    kilit["bitis"] = time.time() + 15
+                return hata
+            bulunan["token"] = db.oturum_olustur(k["id"]) if hatirla else ""
+            oturum_yaz(db.yol, bulunan["token"])
+            bulunan["k"] = k
+            return None
+        diyalog("Giriş", "Kullanıcı adınız ve şifrenizle giriş yapın.",
+                [("Kullanıcı adı", False, ""), ("Şifre", True, "")], "Giriş",
+                onay="Beni bu bilgisayarda hatırla", kontrol=kontrol)
+        return bulunan.get("k"), bulunan["token"]
+
+    def giris_yap():
+        """Açılışta oturum açtırır. False dönerse uygulama kapanır."""
+        try:
+            k, token = None, ""
+            if db.kullanici_sayisi() == 0:
+                k = ilk_yonetici_olustur()
+            else:
+                kayitli = oturum_oku(db.yol)
+                if kayitli:
+                    k = db.oturum_dogrula(kayitli)
+                    token = kayitli if k else ""
+                if not k:
+                    k, token = giris_diyalogu()
+            if not k:
+                return False
+            if k["sifre_degismeli"] and not yeni_sifre_iste(k, True):
+                return False
+        except VeritabaniHatasi as e:
+            messagebox.showerror(UYGULAMA_ADI, str(e))
+            return False
+        oturum.update(id=k["id"], ad=k["kullanici_adi"], yonetici=bool(k["yonetici"]), token=token)
+        return True
+
+    if not giris_yap():
+        kok.destroy()
+        return False
+    kullanici = oturum["ad"]
+
     # ---- durum ---------------------------------------------------------------
     durum = {"satirlar": [], "gorunen": [], "sirala": ("fatura_tarihi", True)}
     v_arama = tk.StringVar()
@@ -2078,6 +2594,7 @@ def arayuzu_calistir():
         ("yapilan_is", "İşin Adı", 280, "w"),
         ("kategori", "Kategori", 170, "w"),
         ("talep", "Talep No - Tarih", 150, "w"),
+        ("talep_eden_birim", "Talep Eden Birim", 260, "w"),
         ("dt_no", "DT No", 100, "w"),
         ("tutar_haric", "Tutar (KDV Hariç)", 130, "e"),
         ("pdf_var", "PDF", 45, "center"),
@@ -2086,11 +2603,16 @@ def arayuzu_calistir():
     tree = ttk.Treeview(orta, columns=[s[0] for s in sutunlar], show="headings", selectmode="browse")
     for ad, baslik, genislik, hiza in sutunlar:
         tree.heading(ad, text=baslik, command=lambda a=ad: sirala_tikla(a))
-        tree.column(ad, width=genislik, anchor=hiza, stretch=(ad in ("firma_adi", "yapilan_is")))
+        tree.column(ad, width=genislik, minwidth=genislik, anchor=hiza,
+                    stretch=(ad in ("firma_adi", "yapilan_is")))
     sb = ttk.Scrollbar(orta, orient="vertical", command=tree.yview)
-    tree.configure(yscrollcommand=sb.set)
-    tree.pack(side="left", fill="both", expand=True)
-    sb.pack(side="right", fill="y")
+    sb_x = ttk.Scrollbar(orta, orient="horizontal", command=tree.xview)
+    tree.configure(yscrollcommand=sb.set, xscrollcommand=sb_x.set)
+    tree.grid(row=0, column=0, sticky="nsew")
+    sb.grid(row=0, column=1, sticky="ns")
+    sb_x.grid(row=1, column=0, sticky="ew")
+    orta.rowconfigure(0, weight=1)
+    orta.columnconfigure(0, weight=1)
 
     # ---- alt bar -------------------------------------------------------------
     alt = ttk.Frame(kok, padding=(8, 4, 8, 8))
@@ -2098,13 +2620,12 @@ def arayuzu_calistir():
     btn_ekle = ttk.Button(alt, text="Yeni Kayıt")
     btn_duzenle = ttk.Button(alt, text="Düzenle")
     btn_sil = ttk.Button(alt, text="Sil")
-    btn_pdf = ttk.Button(alt, text="PDF'i Aç")
     btn_evrak = ttk.Button(alt, text="Evraklar...")
     btn_klasor = ttk.Button(alt, text="Klasörde Göster")
     btn_ozet = ttk.Button(alt, text="Aylık Özet")
     btn_csv = ttk.Button(alt, text="Excel'e Aktar")
     btn_satinalma = ttk.Button(alt, text="Satınalmaya Aktar")
-    for b in (btn_ekle, btn_duzenle, btn_sil, btn_pdf, btn_evrak, btn_klasor, btn_ozet, btn_csv, btn_satinalma):
+    for b in (btn_ekle, btn_duzenle, btn_sil, btn_evrak, btn_klasor, btn_ozet, btn_csv, btn_satinalma):
         b.pack(side="left", padx=3)
     ttk.Label(alt, textvariable=v_toplam, style="Toplam.TLabel").pack(side="right")
 
@@ -2148,7 +2669,8 @@ def arayuzu_calistir():
         for sira, r in enumerate(satirlar):
             tree.insert("", "end", iid=str(r["id"]), tags=("cift",) if sira % 2 else (), values=(
                 tarih_yaz(r["fatura_tarihi"]), r["fatura_no"], r["firma_adi"], r["yapilan_is"] or "",
-                r.get("kategori") or "", talep_yaz(r.get("talep_no"), r.get("talep_tarihi")), r.get("dt_no") or "",
+                r.get("kategori") or "", talep_yaz(r.get("talep_no"), r.get("talep_tarihi")),
+                r.get("talep_eden_birim") or "", r.get("dt_no") or "",
                 tutar_yaz(r["tutar_haric"]), "✔" if r["pdf_yolu"] else "",
                 r.get("ek_sayisi") or ""))
         durum["gorunen"] = satirlar
@@ -2205,6 +2727,59 @@ def arayuzu_calistir():
         v_ay.set(0)
         yenile()
 
+    def ipucu_bagla(agac, gecikme=500):
+        """Tabloda bir hücrenin üstünde bekleyince, sütuna sığmayan metnin tamamını balon olarak gösterir."""
+        import tkinter.font as tkfont
+        d = {"is": None, "pen": None, "hucre": None}
+
+        def kapat(*_):
+            if d["is"]:
+                agac.after_cancel(d["is"])
+                d["is"] = None
+            if d["pen"]:
+                d["pen"].destroy()
+                d["pen"] = None
+
+        def goster(satir, sutun, x, y):
+            d["is"] = None
+            try:
+                metin = str(agac.set(satir, sutun))
+                ad = stil.lookup("Treeview", "font") or "TkDefaultFont"
+                sig = agac.column(sutun, "width") - 14          # hücre kenar boşluğu
+                if not metin or tkfont.Font(font=ad).measure(metin) <= sig:
+                    return                                      # sığıyor, balon gerekmez
+                r = tema["r"]
+                pen = tk.Toplevel(agac)
+                pen.wm_overrideredirect(True)
+                pen.wm_geometry("+%d+%d" % (x + 14, y + 18))
+                tk.Label(pen, text=metin, bg=r["alan"], fg=r["fg"], justify="left", wraplength=520,
+                         padx=8, pady=4, relief="solid", borderwidth=1, font=ad).pack()
+                d["pen"] = pen
+            except tk.TclError:
+                pass
+
+        def hareket(e):
+            satir, sutun = agac.identify_row(e.y), agac.identify_column(e.x)
+            if not satir or not sutun:
+                kapat()
+                d["hucre"] = None
+                return
+            hucre = (satir, sutun)
+            if hucre == d["hucre"]:
+                return                                          # aynı hücrede: balon açıksa kalsın
+            kapat()
+            d["hucre"] = hucre
+            d["is"] = agac.after(gecikme, goster, satir, agac["columns"][int(sutun[1:]) - 1],
+                                 e.x_root, e.y_root)
+
+        def ayril(*_):
+            kapat()
+            d["hucre"] = None
+
+        agac.bind("<Motion>", hareket, add="+")
+        for olay in ("<Leave>", "<ButtonPress>", "<MouseWheel>", "<Key>"):
+            agac.bind(olay, ayril, add="+")
+
     def secili_id():
         s = tree.selection()
         if not s:
@@ -2256,6 +2831,7 @@ def arayuzu_calistir():
             "kategori": tk.StringVar(value=(mevcut.get("kategori") or "") if mevcut else ""),
             "haric": tk.StringVar(value=tutar_yaz(mevcut["tutar_haric"]) if mevcut else ""),
             "talep": tk.StringVar(value=talep_yaz(mevcut.get("talep_no"), mevcut.get("talep_tarihi")) if mevcut else ""),
+            "birim": tk.StringVar(value=(mevcut.get("talep_eden_birim") or "") if mevcut else ""),
             "dt": tk.StringVar(value=(mevcut.get("dt_no") or "") if mevcut else ""),
             "pdf": tk.StringVar(value=(mevcut["pdf_yolu"] or "") if mevcut else ""),
             "vkn": tk.StringVar(value=(mevcut.get("vkn") or "") if mevcut else ""),
@@ -2272,7 +2848,7 @@ def arayuzu_calistir():
         etiketler = [("Kategori", "kategori", False), ("Fatura Tarihi (GG.AA.YYYY)", "tarih", True),
                      ("Fatura No", "no", True), ("Firma Adı", "firma", True), ("İşin Adı", "is", True),
                      ("Tutar (KDV Hariç)", "haric", True), ("Talep No - Talep Tarihi", "talep", True),
-                     ("DT Numarası", "dt", True)]
+                     ("Talep Eden Birim", "birim", True), ("DT Numarası", "dt", True)]
         girisler = {}
         gozat_dugmeleri = []
 
@@ -2452,6 +3028,7 @@ def arayuzu_calistir():
                     "kategori": v["kategori"].get(),
                     "talep_no": talep_no, "talep_tarihi": talep_tarihi,
                     "dt_no": v["dt"].get().strip() or None,
+                    "talep_eden_birim": v["birim"].get().strip() or None,
                     "tutar_haric": tutar_ayristir(v["haric"].get()),
                     "pdf_yolu": v["pdf"].get().strip(),
                     "vkn": v["vkn"].get().strip(),
@@ -2476,14 +3053,14 @@ def arayuzu_calistir():
             yenile()
 
         dugme = ttk.Frame(cerceve)
-        dugme.grid(row=12, column=0, columnspan=3, pady=(14, 0), sticky="e")
+        dugme.grid(row=13, column=0, columnspan=3, pady=(14, 0), sticky="e")
         ttk.Button(dugme, text="Kaydet", command=kaydet).pack(side="left", padx=4)
         ttk.Button(dugme, text="Vazgeç", command=pen.destroy).pack(side="left", padx=4)
         if mevcut:
             ttk.Label(cerceve, style="Not.TLabel", text="Kaydeden: %s  (%s)%s" % (
                 mevcut["kaydeden"] or "-", mevcut["kayit_tarihi"] or "",
                 ("   |   Son düzenleyen: %s (%s)" % (mevcut["son_duzenleyen"], mevcut["duzenleme_tarihi"]))
-                if mevcut["son_duzenleyen"] else "")).grid(row=13, column=0, columnspan=3, sticky="w", pady=(10, 0))
+                if mevcut["son_duzenleyen"] else "")).grid(row=14, column=0, columnspan=3, sticky="w", pady=(10, 0))
         girisler["tarih"].focus_set()
         pen.bind("<Escape>", lambda e: pen.destroy())
 
@@ -2584,6 +3161,9 @@ def arayuzu_calistir():
             form_ac(fid)
 
     def sil():
+        if not oturum["yonetici"]:
+            messagebox.showinfo(UYGULAMA_ADI, "Fatura silme yetkisi yalnızca yöneticidedir.", parent=kok)
+            return
         fid = secili_id()
         if not fid:
             return
@@ -2625,6 +3205,7 @@ def arayuzu_calistir():
         kol = [("tur", "Tür", 120), ("dosya", "Dosya", 300), ("aciklama", "Açıklama", 190),
                ("ekleyen", "Ekleyen", 100), ("tarih", "Tarih", 90), ("durum", "Durum", 70)]
         agac = ttk.Treeview(orta2, columns=[k[0] for k in kol], show="headings", selectmode="browse")
+        ipucu_bagla(agac)
         for ad, baslik, gen in kol:
             agac.heading(ad, text=baslik)
             agac.column(ad, width=gen, anchor="w", stretch=(ad in ("dosya", "aciklama")))
@@ -2750,18 +3331,6 @@ def arayuzu_calistir():
         if agac.get_children():
             agac.selection_set(agac.get_children()[0])
 
-    def pdf_ac_btn(*_):
-        fid = secili_id()
-        if not fid:
-            return
-        k = db.getir(fid)
-        try:
-            if not k or not k["pdf_yolu"]:
-                raise FileNotFoundError("Bu faturaya bağlı bir PDF yok.")
-            pdf_ac(k["pdf_yolu"])
-        except (OSError, FileNotFoundError) as e:
-            hata_goster(e)
-
     def klasor_btn():
         fid = secili_id()
         if not fid:
@@ -2807,9 +3376,140 @@ def arayuzu_calistir():
             hata_goster(e)
 
     def satinalma_btn():
-        # TODO: Satınalma Excel'inin sütun başlıkları ve sırası belli olunca yazılacak (kategori sayfaları olmayacak).
-        messagebox.showinfo(UYGULAMA_ADI, "Satınalma Excel'i biçimi henüz tanımlanmadı.\n"
-                                          "Biçim verildiğinde bu düğme kayıtları o biçimde aktaracak.", parent=kok)
+        satirlar = durum.get("gorunen", [])
+        if not satirlar:
+            messagebox.showinfo(UYGULAMA_ADI, "Aktarılacak kayıt yok.", parent=kok)
+            return
+        if openpyxl is None:
+            messagebox.showerror(UYGULAMA_ADI, "Satınalma Excel'i için 'openpyxl' kütüphanesi gerekli.", parent=kok)
+            return
+        ay, yil = v_ay.get(), v_yil.get()
+        baslik = " ".join(x for x in ((yil if yil != "Tümü" else ""), tr_buyuk(AY_ADLARI[ay - 1]) if ay else "") if x)
+        baslik = (baslik + " " if baslik else "") + "HARCAMA LİSTESİ"
+        yol = filedialog.asksaveasfilename(
+            parent=kok, title="Satınalmaya aktar (%s)" % donem_adi(), defaultextension=".xlsx",
+            filetypes=[("Excel çalışma kitabı", "*.xlsx")],
+            initialfile="Makine İkmal Harcama Listesi - %s" % (AY_ADLARI[ay - 1] if ay else donem_adi()))
+        if not yol:
+            return
+        try:
+            satinalma_xlsx_yaz(yol, satirlar, baslik, yil if yil != "Tümü" else "Harcama Listesi")
+            if messagebox.askyesno(UYGULAMA_ADI, "%d kayıt satınalma listesine aktarıldı:\n%s\n\nDosya şimdi açılsın mı?"
+                                   % (len(satirlar), yol), parent=kok):
+                pdf_ac(yol)
+        except PermissionError:
+            messagebox.showerror(UYGULAMA_ADI, "Dosya yazılamadı. Excel'de açık olabilir; kapatıp tekrar deneyin.", parent=kok)
+        except (OSError, FileNotFoundError) as e:
+            hata_goster(e)
+
+    # ---- hesap menüsü eylemleri ------------------------------------------------
+    def sifremi_degistir():
+        if yeni_sifre_iste({"id": oturum["id"]}, False, eski_iste=True, ana=kok):
+            messagebox.showinfo(UYGULAMA_ADI, "Şifreniz değiştirildi.", parent=kok)
+
+    def oturumu_kapat():
+        if not messagebox.askyesno(UYGULAMA_ADI, "Oturum kapatılsın mı? Giriş ekranına dönülür.", parent=kok):
+            return
+        try:
+            if oturum["token"]:
+                db.oturum_kapat(oturum["token"])
+        except VeritabaniHatasi:
+            pass
+        oturum_yaz(db.yol, "")                  # bu bilgisayardaki 'beni hatırla' kaydı silinir
+        oturum["yeniden"] = True
+        kok.destroy()
+
+    def kullanicilar_penceresi():
+        pen = yeni_pencere("Kullanıcılar")
+        pen.geometry("620x380")
+        pen.grab_set()
+        agac = ttk.Treeview(pen, columns=("ad", "rol", "durum"), show="headings", selectmode="browse")
+        for ad, baslik, gen in (("ad", "Kullanıcı Adı", 250), ("rol", "Yetki", 110), ("durum", "Durum", 190)):
+            agac.heading(ad, text=baslik)
+            agac.column(ad, width=gen, anchor="w")
+        agac.pack(fill="both", expand=True, padx=10, pady=(10, 4))
+        kayitlar = {}
+
+        def doldur(secilecek=None):
+            agac.delete(*agac.get_children())
+            kayitlar.clear()
+            for u in db.kullanicilar():
+                kayitlar[str(u["id"])] = u
+                durum = "Pasif" if not u["aktif"] else ("Şifre değiştirmeli" if u["sifre_degismeli"] else "Aktif")
+                agac.insert("", "end", iid=str(u["id"]),
+                            values=(u["kullanici_adi"], "Yönetici" if u["yonetici"] else "Kullanıcı", durum))
+            if secilecek and agac.exists(secilecek):
+                agac.selection_set(secilecek)
+
+        def secili(baskasi=True):
+            s = agac.selection()
+            if not s:
+                messagebox.showinfo(UYGULAMA_ADI, "Önce listeden bir kullanıcı seçin.", parent=pen)
+                return None
+            if baskasi and int(s[0]) == oturum["id"]:
+                messagebox.showinfo(UYGULAMA_ADI, "Bu işlem kendi hesabınız için yapılamaz.\n"
+                                    "(Şifrenizi Dosya > Şifremi Değiştir'den değiştirebilirsiniz.)", parent=pen)
+                return None
+            return kayitlar[s[0]]
+
+        def dene(fonk):
+            try:
+                fonk()
+            except VeritabaniHatasi as e:
+                messagebox.showerror(UYGULAMA_ADI, str(e), parent=pen)
+            doldur()
+
+        def yeni():
+            def kontrol(d, yonetici):
+                db.kullanici_ekle(d[0], d[1], yonetici=yonetici, sifre_degismeli=True)
+                return None
+            sonuc = diyalog("Yeni Kullanıcı", "Geçici şifreyi kullanıcıya iletin; ilk girişte kendi şifresini belirleyecek.",
+                            [("Kullanıcı adı", False, ""), ("Geçici şifre", False, gecici_sifre())], "Ekle",
+                            onay="Yönetici olsun", kontrol=kontrol, ana=pen)
+            if sonuc:
+                messagebox.showinfo(UYGULAMA_ADI, "Hesap oluşturuldu.\n\nKullanıcı adı: %s\nGeçici şifre: %s\n\n"
+                                    "Bu bilgileri kullanıcıya iletin." % (sonuc[0][0].strip(), sonuc[0][1]), parent=pen)
+            doldur()
+
+        def sifirla():
+            u = secili()
+            if not u:
+                return
+
+            def kontrol(d, _onay):
+                db.sifre_sifirla(u["id"], d[0])
+                return None
+            sonuc = diyalog("Şifre Sıfırla", "'%s' için yeni geçici şifre. Kullanıcı ilk girişte değiştirecek."
+                            % u["kullanici_adi"], [("Geçici şifre", False, gecici_sifre())], "Sıfırla",
+                            kontrol=kontrol, ana=pen)
+            if sonuc:
+                messagebox.showinfo(UYGULAMA_ADI, "Şifre sıfırlandı.\n\nKullanıcı adı: %s\nGeçici şifre: %s"
+                                    % (u["kullanici_adi"], sonuc[0][0]), parent=pen)
+            doldur(str(u["id"]))
+
+        def yetki():
+            u = secili()
+            if u:
+                dene(lambda: db.kullanici_durumu(u["id"], yonetici=not u["yonetici"]))
+
+        def aktif_pasif():
+            u = secili()
+            if not u:
+                return
+            if u["aktif"] and not messagebox.askyesno(
+                    UYGULAMA_ADI, "'%s' pasife alınsın mı? Giriş yapamaz, kayıtları durur." % u["kullanici_adi"],
+                    parent=pen):
+                return
+            dene(lambda: db.kullanici_durumu(u["id"], aktif=not u["aktif"]))
+
+        alt_k = ttk.Frame(pen, padding=(10, 4, 10, 10))
+        alt_k.pack(fill="x")
+        for metin, komut in (("Yeni Kullanıcı...", yeni), ("Şifre Sıfırla...", sifirla),
+                             ("Yönetici Yap / Al", yetki), ("Pasife Al / Aktif Et", aktif_pasif),
+                             ("Kapat", pen.destroy)):
+            ttk.Button(alt_k, text=metin, command=komut).pack(side="left", padx=3)
+        pen.bind("<Escape>", lambda e: pen.destroy())
+        dene(lambda: None)
 
     # ---- menü ----------------------------------------------------------------
     menu = tk.Menu(kok)
@@ -2817,6 +3517,11 @@ def arayuzu_calistir():
     m_dosya.add_command(label="Excel'e Aktar...", command=csv_btn)
     m_dosya.add_command(label="Aylık Özet...", command=ozet_penceresi)
     m_dosya.add_command(label="PDF Okuma Testi...", command=okuma_testi)
+    m_dosya.add_separator()
+    m_dosya.add_command(label="Şifremi Değiştir...", command=sifremi_degistir)
+    if oturum["yonetici"]:
+        m_dosya.add_command(label="Kullanıcılar...", command=kullanicilar_penceresi)
+    m_dosya.add_command(label="Oturumu Kapat", command=oturumu_kapat)
     m_dosya.add_separator()
     m_dosya.add_command(label="Çıkış", command=kok.destroy)
     m_gor = tk.Menu(menu, tearoff=0)
@@ -2836,13 +3541,13 @@ def arayuzu_calistir():
     btn_ekle.configure(command=lambda: form_ac())
     btn_duzenle.configure(command=duzenle)
     btn_sil.configure(command=sil)
-    btn_pdf.configure(command=pdf_ac_btn)
     btn_klasor.configure(command=klasor_btn)
     btn_evrak.configure(command=lambda: evrak_penceresi())
     btn_ozet.configure(command=ozet_penceresi)
     btn_csv.configure(command=csv_btn)
     btn_satinalma.configure(command=satinalma_btn)
     btn_temizle.configure(command=temizle)
+    ipucu_bagla(tree)
     tree.bind("<Double-1>", lambda e: evrak_penceresi())
     tree.bind("<Return>", duzenle)
     tree.bind("<Delete>", lambda e: sil())
@@ -2859,11 +3564,54 @@ def arayuzu_calistir():
         v_yil.set(str(max(int(r["fatura_tarihi"][:4]) for r in ilk)) if ilk else str(date.today().year))
     except (VeritabaniHatasi, ValueError):
         v_yil.set(str(date.today().year))
-    kok.title("%s   -   %s" % (UYGULAMA_ADI, kullanici))
+    kok.title("%s   -   %s%s" % (UYGULAMA_ADI, kullanici, "  (Yönetici)" if oturum["yonetici"] else ""))
     yenile()
+
+    def modal_one_getir(e=None):
+        """Ana pencere yeniden etkin olunca (alt-tab, görev çubuğu, küçültüp açma) odağı tutan modal pencere
+        (form, evrak, kullanıcılar...) arkada kalmışsa öne getirir; yoksa uygulama tıklanamaz/kilitli görünür."""
+        if e is not None and e.widget is not kok:
+            return
+        try:
+            g = kok.grab_current()
+            if g is not None and g is not kok and g.winfo_exists():
+                g.deiconify()
+                g.lift()
+                g.focus_set()
+        except tk.TclError:
+            pass
+    kok.bind("<FocusIn>", modal_one_getir, add="+")
+    kok.bind("<Map>", modal_one_getir, add="+")
+
+    kok.deiconify()
+    kok.lift()
+    kok.focus_force()                  # giriş penceresinden sonra ana pencere ön planda ve odakta açılsın
     e_ara.focus_set()
     kok.mainloop()
+    return oturum["yeniden"]          # 'Oturumu Kapat' seçildiyse giriş ekranıyla yeniden başlar
+
+
+def yonetici_kurtarma_komutu():
+    """python fatura_takip.py --yonetici-sifirla : yönetici şifresi unutulduysa komut satırından yenisini belirler
+    (hesap yoksa yönetici olarak açar). Veritabanı dosyasına erişimi olan kişi yapabilir."""
+    ayar = ayarlari_oku()
+    try:
+        db = FaturaDB(ayar["veritabani"])
+        print("Veritabanı:", ayar["veritabani"])
+        ad = input("Yönetici kullanıcı adı (yoksa yeni açılır): ").strip()
+        sifre = getpass.getpass("Yeni şifre: ")
+        if sifre != getpass.getpass("Yeni şifre (tekrar): "):
+            print("Şifreler aynı değil, işlem iptal edildi.")
+            return
+        db.yonetici_kurtar(ad, sifre)
+        print("Tamam: '%s' yönetici olarak ayarlandı, şifresi yenilendi." % ad)
+    except VeritabaniHatasi as e:
+        print("Hata:", e)
 
 
 if __name__ == "__main__":
-    arayuzu_calistir()
+    if "--yonetici-sifirla" in sys.argv:
+        yonetici_kurtarma_komutu()
+    else:
+        while arayuzu_calistir():
+            pass
