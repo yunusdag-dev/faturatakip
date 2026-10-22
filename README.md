@@ -6,6 +6,8 @@
 
 **Küçük ekipler için, ortak ağda çalışan, PDF faturayı okuyup formu kendisi dolduran masaüstü fatura kayıt uygulaması.**
 
+**Türkçe** · [English](README.en.md)
+
 ![Python](https://img.shields.io/badge/Python-3.x-3776AB?logo=python&logoColor=white)
 ![SQLite](https://img.shields.io/badge/SQLite-ortak%20ağ%20klasörü-003B57?logo=sqlite&logoColor=white)
 ![Platform](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D6?logo=windows&logoColor=white)
