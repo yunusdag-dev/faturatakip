@@ -425,7 +425,8 @@ class FaturaDB:
         return self._calistir(f)
 
     def sifre_degistir(self, kid, yeni, eski=None):
-        """eski verilirse mevcut şifre doğrulanır. Kullanıcı kendi şifresini seçtiği için 'değiştirmeli' bayrağı kalkar."""
+        """eski verilirse mevcut şifre doğrulanır. Kullanıcı kendi şifresini seçtiği için 'değiştirmeli' bayrağı kalkar.
+        Kullanıcının tüm 'beni hatırla' oturumları düşürülür (çağıran, bu bilgisayar için gerekirse yenisini açar)."""
         self._sifre_kontrol(yeni)
 
         def f(con):
@@ -435,6 +436,7 @@ class FaturaDB:
             if eski is not None and not sifre_dogru_mu(eski, r["sifre"]):
                 raise VeritabaniHatasi("Mevcut şifre hatalı.")
             con.execute("UPDATE kullanicilar SET sifre=?, sifre_degismeli=0 WHERE id=?", (sifre_hashle(yeni), kid))
+            con.execute("DELETE FROM oturumlar WHERE kullanici_id=?", (kid,))   # eski şifreyle açılmış oturumlar düşer
         self._calistir(f)
 
     def sifre_sifirla(self, kid, gecici):
@@ -466,6 +468,8 @@ class FaturaDB:
                 self._sifre_kontrol(sifre)
                 con.execute("UPDATE kullanicilar SET sifre=?, yonetici=1, aktif=1, sifre_degismeli=0 "
                             "WHERE kullanici_anahtar=?", (sifre_hashle(sifre), tr_kucuk(ad)))
+                con.execute("DELETE FROM oturumlar WHERE kullanici_id = "
+                            "(SELECT id FROM kullanicilar WHERE kullanici_anahtar=?)", (tr_kucuk(ad),))
             else:
                 self._kullanici_ekle(con, ad, sifre, True, False)
         self._calistir(f)
@@ -2515,6 +2519,12 @@ def arayuzu_calistir():
                 onay="Beni bu bilgisayarda hatırla", kontrol=kontrol)
         return bulunan.get("k"), bulunan["token"]
 
+    def hatirlamayi_yenile(kid):
+        """Şifre değişince eski anahtarlar silinir; bu bilgisayarda 'beni hatırla' açıksa yeni anahtar verilir."""
+        token = db.oturum_olustur(kid)
+        oturum_yaz(db.yol, token)
+        return token
+
     def giris_yap():
         """Açılışta oturum açtırır. False dönerse uygulama kapanır."""
         try:
@@ -2530,8 +2540,11 @@ def arayuzu_calistir():
                     k, token = giris_diyalogu()
             if not k:
                 return False
-            if k["sifre_degismeli"] and not yeni_sifre_iste(k, True):
-                return False
+            if k["sifre_degismeli"]:
+                if not yeni_sifre_iste(k, True):
+                    return False
+                if token:
+                    token = hatirlamayi_yenile(k["id"])
         except VeritabaniHatasi as e:
             messagebox.showerror(UYGULAMA_ADI, str(e))
             return False
@@ -3405,6 +3418,11 @@ def arayuzu_calistir():
     # ---- hesap menüsü eylemleri ------------------------------------------------
     def sifremi_degistir():
         if yeni_sifre_iste({"id": oturum["id"]}, False, eski_iste=True, ana=kok):
+            try:
+                if oturum["token"]:
+                    oturum["token"] = hatirlamayi_yenile(oturum["id"])
+            except VeritabaniHatasi:
+                oturum["token"] = ""
             messagebox.showinfo(UYGULAMA_ADI, "Şifreniz değiştirildi.", parent=kok)
 
     def oturumu_kapat():
