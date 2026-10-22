@@ -7,6 +7,7 @@ config.ini
 # Fatura / evrak dosyaları
 *.pdf
 *.xlsx
+!sablon/satinalma_sablonu.xlsx
 *.csv
 
 # Derleme çıktıları

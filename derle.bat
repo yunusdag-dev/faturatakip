@@ -5,7 +5,7 @@ rem Gerekenler (bir kez): pip install pyinstaller pymupdf openpyxl sv_ttk
 cd /d "%~dp0"
 
 python -m PyInstaller --noconfirm --clean --onedir --windowed --name FaturaTakip ^
-  --icon ikon.ico --add-data "ikon.ico;." ^
+  --icon ikon.ico --add-data "ikon.ico;." --add-data "sablon\satinalma_sablonu.xlsx;sablon" ^
   --collect-all sv_ttk --collect-all pymupdf --hidden-import openpyxl ^
   fatura_takip.py
 if errorlevel 1 (
