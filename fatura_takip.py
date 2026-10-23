@@ -81,8 +81,13 @@ def ayarlari_oku(config_yolu=CONFIG_YOLU):
     cfg = configparser.ConfigParser(interpolation=None)
     varsayilan = {"veritabani": "fatura.db", "tarama_klasoru": "", "tema": "Açık",
                   "kurum_anahtar": "", "kurum_vkn": ""}
+    okunabilir = True
     if os.path.exists(config_yolu):
-        cfg.read(config_yolu, encoding="utf-8")
+        try:
+            cfg.read(config_yolu, encoding="utf-8")
+        except (configparser.Error, UnicodeDecodeError, OSError):
+            cfg = configparser.ConfigParser(interpolation=None)       # bozuk dosya: varsayılanlarla devam et
+            okunabilir = False
     if not cfg.has_section("ayarlar"):
         cfg.add_section("ayarlar")
     degisti = False
@@ -90,7 +95,7 @@ def ayarlari_oku(config_yolu=CONFIG_YOLU):
         if not cfg.has_option("ayarlar", anahtar):
             cfg.set("ayarlar", anahtar, deger)
             degisti = True
-    if degisti or not os.path.exists(config_yolu):
+    if okunabilir and (degisti or not os.path.exists(config_yolu)):     # bozuk dosyanın üzerine yazma
         try:
             with open(config_yolu, "w", encoding="utf-8") as f:
                 cfg.write(f)
@@ -208,9 +213,10 @@ class MukerrerKayit(VeritabaniHatasi):
 
 
 # ---- kullanıcı hesapları: şifre hash'leme ve "beni hatırla" oturum dosyası ---------------------
-SIFRE_EN_AZ = 6
+SIFRE_EN_AZ = 8
+KULLANICI_ADI_EN_UZUN = 40
 OTURUM_GUN = 90                       # "beni hatırla" anahtarının geçerlilik süresi
-_PBKDF2_TUR = 200_000
+_PBKDF2_TUR = 600_000                 # OWASP önerisi (PBKDF2-HMAC-SHA256); eski hash'ler kendi tur sayısıyla doğrulanır
 _SIFRE_HARFLERI = "abcdefghjkmnpqrstuvwxyz23456789"       # 0/O, 1/l/I gibi karışanlar yok
 
 
@@ -228,6 +234,16 @@ def sifre_dogru_mu(sifre, kayit):
     except ValueError:
         return False
     return hmac.compare_digest(beklenen.hex(), h)
+
+
+_sahte = {}
+
+
+def _sahte_hash():
+    """Olmayan kullanıcı adında da aynı süreyi harcamak için (yanıt süresinden hesap varlığı sezilmesin)."""
+    if "h" not in _sahte:
+        _sahte["h"] = sifre_hashle("sahte-sifre")
+    return _sahte["h"]
 
 
 def gecici_sifre(uzunluk=8):
@@ -393,6 +409,9 @@ class FaturaDB:
         ad = (ad or "").strip()
         if not ad:
             raise VeritabaniHatasi("Kullanıcı adı boş olamaz.")
+        if len(ad) > KULLANICI_ADI_EN_UZUN or any(ord(c) < 32 for c in ad):
+            raise VeritabaniHatasi("Kullanıcı adı en fazla %d karakter olmalı ve denetim karakteri içermemeli."
+                                   % KULLANICI_ADI_EN_UZUN)
         self._sifre_kontrol(sifre)
         if con.execute("SELECT 1 FROM kullanicilar WHERE kullanici_anahtar=?", (tr_kucuk(ad),)).fetchone():
             raise MukerrerKayit("'%s' adlı bir kullanıcı zaten var." % ad)
@@ -417,10 +436,19 @@ class FaturaDB:
         """-> (kayıt | None, hata metni). Pasif hesabın durumu yalnızca şifre doğruysa söylenir."""
         def f(con):
             r = con.execute("SELECT * FROM kullanicilar WHERE kullanici_anahtar=?", (tr_kucuk(ad),)).fetchone()
-            if not r or not sifre_dogru_mu(sifre, r["sifre"]):
+            if not r:
+                sifre_dogru_mu(sifre, _sahte_hash())
+                return None, "Kullanıcı adı veya şifre hatalı."
+            if not sifre_dogru_mu(sifre, r["sifre"]):
                 return None, "Kullanıcı adı veya şifre hatalı."
             if not r["aktif"]:
                 return None, "Bu hesap pasife alınmış. Yöneticinize başvurun."
+            try:
+                eski_tur = int(r["sifre"].split("$")[1])
+            except (ValueError, IndexError):
+                eski_tur = 0
+            if eski_tur < _PBKDF2_TUR:              # eski (daha az turlu) hash'i girişte yenisiyle değiştir
+                con.execute("UPDATE kullanicilar SET sifre=? WHERE id=?", (sifre_hashle(sifre), r["id"]))
             return dict(r), ""
         return self._calistir(f)
 
@@ -780,7 +808,7 @@ def _kategori_sayfasi_yaz(ws, satirlar, baslik, st):
                 c.alignment = st["orta"]
             else:
                 c.alignment = st["sol"]
-        if r["pdf_yolu"]:
+        if r["pdf_yolu"] and guvenli_acilir(r["pdf_yolu"]):
             for sutun in (2, 9):                # Fatura No ve PDF Konumu hücreleri faturanın PDF'ini açar
                 try:
                     hucre = ws.cell(row=sat, column=sutun)
@@ -966,10 +994,28 @@ def csv_yaz(yol, satirlar):
 # 4) WINDOWS YARDIMCILARI (PDF aç / klasörde göster)
 # ----------------------------------------------------------------------------
 
+# Uygulamadan "Aç" ile açılabilen belge türleri. Yollar ortak veritabanından geldiği için (başka biri .exe/.bat/.lnk gibi
+# çalıştırılabilir bir dosyayı kayda bağlamış olabilir) yalnızca bu güvenli belge/resim türleri açılır.
+GUVENLI_UZANTILAR = frozenset((".pdf", ".doc", ".docx", ".rtf", ".odt", ".txt", ".xls", ".xlsx", ".ods", ".csv",
+                               ".ppt", ".pptx", ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff", ".eml", ".msg"))
+
+
+class GuvensizDosyaTuru(OSError):
+    pass
+
+
+def guvenli_acilir(yol):
+    """Dosya, açılması güvenli bir belge/resim türünde mi? (Yalnızca uzantıya bakar; var olup olmadığına bakmaz.)"""
+    return os.path.splitext(str(yol or "").strip())[1].lower() in GUVENLI_UZANTILAR
+
+
 def pdf_ac(yol):
     if not yol or not os.path.exists(yol):
         raise FileNotFoundError("Dosya bulunamadı:\n%s\n\nTaşınmış ya da silinmiş olabilir; "
                                 "ağ bağlantısını da kontrol edin." % (yol or "(yol girilmemiş)"))
+    if not guvenli_acilir(yol):
+        raise GuvensizDosyaTuru("Güvenlik nedeniyle bu dosya türü uygulamadan açılmaz:\n%s\n\n"
+                                "Dosyayı 'Klasörde Göster' ile bulup kendiniz açabilirsiniz." % yol)
     if hasattr(os, "startfile"):
         os.startfile(yol)  # Windows
     else:
@@ -1010,6 +1056,11 @@ def _carp(a, b):
             a[4] * b[0] + a[5] * b[2] + b[4], a[4] * b[1] + a[5] * b[3] + b[5])
 
 
+_AKIS_EN_COK = 64 * 1024 * 1024            # tek bir PDF akışının açılmış en büyük boyutu (sıkıştırma bombası önlemi)
+_PDF_EN_COK = 300 * 1024 * 1024            # yerleşik okuyucunun belleğe alacağı en büyük PDF
+_DOCX_XML_EN_COK = 30 * 1024 * 1024        # DOCX içindeki document.xml'in açılmış en büyük boyutu
+
+
 def _akis_coz(sozluk, ham):
     """Akışın filtrelerini (Flate, ASCII85, ASCIIHex) çözer. Desteklenmeyen filtrede None döner."""
     m = re.search(rb"/Filter\s*(\[[^\]]*\]|/[A-Za-z0-9]+)", sozluk)
@@ -1019,7 +1070,10 @@ def _akis_coz(sozluk, ham):
     for ad in re.findall(rb"/([A-Za-z0-9]+)", m.group(1)):
         try:
             if ad in (b"FlateDecode", b"Fl"):
-                veri = zlib.decompressobj().decompress(veri)
+                dz = zlib.decompressobj()
+                veri = dz.decompress(veri, _AKIS_EN_COK)
+                if dz.unconsumed_tail:                  # sınır aşıldı: bu akış okunmaz
+                    return None
             elif ad in (b"ASCII85Decode", b"A85"):
                 v = veri.strip()
                 if v.startswith(b"<~"):
@@ -1451,6 +1505,8 @@ def _sayfa_fontlari(nesneler, sozluk, derinlik=0):
 def pdf_sayfa_metinleri(yol, en_cok_sayfa=60):
     """Yerleşik okuyucuyla her sayfanın yazı katmanını ayrı ayrı okur -> (sayfa_metinleri, toplam_sayfa).
     Yazı katmanı olmayan sayfaların metni boş gelir."""
+    if os.path.getsize(yol) > _PDF_EN_COK:
+        return [], 0                            # aşırı büyük dosya belleğe alınmaz (PyMuPDF/OCR yoluna kalır)
     with open(yol, "rb") as f:
         veri = f.read()
     if re.search(rb"/Encrypt\b", veri):
@@ -1965,6 +2021,8 @@ def docx_satirlari(yol):
     Ek kütüphane gerekmez: DOCX bir zip, içindeki word/document.xml okunur."""
     try:
         with zipfile.ZipFile(yol) as z:
+            if z.getinfo("word/document.xml").file_size > _DOCX_XML_EN_COK:
+                raise ValueError("DOCX dosyası beklenenden çok büyük, okunmadı.")
             ham = z.read("word/document.xml")
         if b"<!DOCTYPE" in ham or b"<!ENTITY" in ham:   # gerçek Word belgelerinde olmaz; XXE / "billion laughs" önlemi
             raise ValueError("DOCX dosyası güvenli görünmüyor, okunmadı.")

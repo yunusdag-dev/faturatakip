@@ -110,6 +110,8 @@ pip install pymupdf openpyxl sv_ttk      # hepsi isteğe bağlı
 python fatura_takip.py
 ```
 
+Testleri çalıştırmak için (arayüz gerekmez, gerçek veri kullanmaz): `python -m unittest discover -s tests -v`
+
 Exe üretmek için bir kez `pip install pyinstaller` yapın, ardından [derle.bat](derle.bat) dosyasına çift tıklayın. Çıktı `dist\FaturaTakip\` içindedir.
 
 ## Ayarlar (`config.ini`)

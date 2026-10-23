@@ -109,6 +109,8 @@ pip install pymupdf openpyxl sv_ttk      # all optional
 python fatura_takip.py
 ```
 
+To run the tests (no GUI needed, no real data used): `python -m unittest discover -s tests -v`
+
 To build the exe, run `pip install pyinstaller` once, then double-click [derle.bat](derle.bat). The output is in `dist\FaturaTakip\`.
 
 ## Settings (`config.ini`)
