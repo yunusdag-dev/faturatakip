@@ -659,6 +659,29 @@ def filtrele(satirlar, arama="", firma="", bas=None, bit=None, yil=None, ay=None
     return sonuc
 
 
+def fatura_ara(satirlar, firma="", fatura_no="", en_az=None, en_cok=None):
+    """Fatura Bul: verilen tüm ölçütleri birlikte sağlayan kayıtlar (VE). firma / fatura_no: içinde geçen metin
+    (büyük-küçük harf ve Türkçe İ/ı farkı önemsiz; fatura no'da boşluklar yok sayılır). en_az / en_cok: KDV hariç
+    tutar sınırları, kuruş cinsinden ve sınırlar dahil. Boş ölçüt yok sayılır; tutar sınırı varken tutarsız kayıt çıkmaz."""
+    f = tr_kucuk(firma)
+    n = tr_kucuk(fatura_no).replace(" ", "")
+    sonuc = []
+    for r in satirlar:
+        if f and f not in tr_kucuk(r["firma_adi"]):
+            continue
+        if n and n not in tr_kucuk(r["fatura_no"]).replace(" ", ""):
+            continue
+        t = r["tutar_haric"]
+        if (en_az is not None or en_cok is not None) and t is None:
+            continue
+        if en_az is not None and t < en_az:
+            continue
+        if en_cok is not None and t > en_cok:
+            continue
+        sonuc.append(r)
+    return sonuc
+
+
 def aylik_ozet(satirlar, yil):
     """Seçilen yılın 12 ayı için adet / KDV hariç toplamları + son satırda TOPLAM."""
     sonuc = []
@@ -2596,6 +2619,8 @@ def arayuzu_calistir():
     ttk.Entry(ust, textvariable=v_bit, width=11).grid(row=0, column=7, padx=(2, 8))
     btn_temizle = ttk.Button(ust, text="Filtreleri Temizle")
     btn_temizle.grid(row=0, column=8, padx=4)
+    btn_bul = ttk.Button(ust, text="\U0001F50D Fatura Bul")
+    btn_bul.grid(row=0, column=9, padx=4)
 
     # ---- tablo ---------------------------------------------------------------
     orta = ttk.Frame(kok, padding=(8, 4))
@@ -2695,6 +2720,8 @@ def arayuzu_calistir():
             tree.heading(ad, text=baslik + ok)
 
     def yenile(*_):
+        if durum.get("askida"):
+            return
         try:
             fv = filtre_degerleri()
             if fv is None:
@@ -2731,6 +2758,142 @@ def arayuzu_calistir():
         eski, azalan = durum["sirala"]
         durum["sirala"] = (sutun, (not azalan) if eski == sutun else False)
         yenile()
+
+    def fatura_bul_penceresi(*_):
+        """Mercek: tüm faturalar içinde firma adı / fatura no / tutara göre arar; seçileni ana listede gösterir."""
+        eski = durum.get("bul_pen")
+        if eski is not None:
+            try:
+                if eski.winfo_exists():
+                    eski.deiconify()
+                    eski.lift()
+                    eski.focus_force()
+                    return
+            except tk.TclError:
+                pass
+        pen = yeni_pencere("Fatura Bul")
+        durum["bul_pen"] = pen
+        pen.geometry("940x520")
+        pen.minsize(760, 380)
+        pen.bind("<Destroy>", lambda e: durum.update(bul_pen=None) if e.widget is pen else None)
+        v_f, v_n, v_a, v_b = tk.StringVar(), tk.StringVar(), tk.StringVar(), tk.StringVar()
+        v_bilgi = tk.StringVar()
+        kayit = {"tum": [], "bulunan": {}}
+
+        ust_k = ttk.Frame(pen, padding=(12, 12, 12, 4))
+        ust_k.pack(fill="x")
+        ttk.Label(ust_k, text="Firma adı:").grid(row=0, column=0, sticky="w")
+        e_f = ttk.Entry(ust_k, textvariable=v_f, width=36)
+        e_f.grid(row=0, column=1, padx=(6, 18), pady=3, sticky="w")
+        ttk.Label(ust_k, text="Fatura no:").grid(row=0, column=2, sticky="w")
+        e_n = ttk.Entry(ust_k, textvariable=v_n, width=24)
+        e_n.grid(row=0, column=3, padx=(6, 0), pady=3, sticky="w")
+        ttk.Label(ust_k, text="Tutar (KDV hariç):").grid(row=1, column=0, sticky="w")
+        tutar_k = ttk.Frame(ust_k)
+        tutar_k.grid(row=1, column=1, columnspan=3, padx=(6, 0), pady=3, sticky="w")
+        e_a = ttk.Entry(tutar_k, textvariable=v_a, width=14)
+        e_a.pack(side="left")
+        ttk.Label(tutar_k, text="  -  ").pack(side="left")
+        e_b = ttk.Entry(tutar_k, textvariable=v_b, width=14)
+        e_b.pack(side="left")
+        ttk.Label(tutar_k, text="   Tek tutar yazarsanız tam eşleşme, iki tutar yazarsanız aralık aranır.",
+                  style="Not.TLabel").pack(side="left")
+        ttk.Label(pen, textvariable=v_bilgi, style="Not.TLabel", padding=(12, 0, 12, 4)).pack(anchor="w")
+
+        orta_k = ttk.Frame(pen, padding=(12, 0))
+        orta_k.pack(fill="both", expand=True)
+        kolonlar = [("tarih", "Fatura Tarihi", 100, "center"), ("no", "Fatura No", 150, "w"),
+                    ("firma", "Firma Adı", 300, "w"), ("tutar", "Tutar (KDV Hariç)", 120, "e"),
+                    ("is", "İşin Adı", 260, "w")]
+        agac = ttk.Treeview(orta_k, columns=[k[0] for k in kolonlar], show="headings", selectmode="browse")
+        for ad, baslik, gen, hiza in kolonlar:
+            agac.heading(ad, text=baslik)
+            agac.column(ad, width=gen, minwidth=gen // 2, anchor=hiza, stretch=(ad in ("firma", "is")))
+        sb_k = ttk.Scrollbar(orta_k, orient="vertical", command=agac.yview)
+        agac.configure(yscrollcommand=sb_k.set)
+        agac.pack(side="left", fill="both", expand=True)
+        sb_k.pack(side="right", fill="y")
+        agac.tag_configure("cift", background=tema["r"]["zebra"])
+        ipucu_bagla(agac)
+
+        def ara(*_):
+            hata = ""
+            sinirlar = []
+            for v in (v_a, v_b):
+                try:
+                    sinirlar.append(tutar_ayristir(v.get()))
+                except ValueError:
+                    sinirlar.append(None)
+                    hata = "Geçersiz tutar: %s" % v.get().strip()
+            en_az, en_cok = sinirlar
+            if en_az is not None and not v_b.get().strip():
+                en_cok = en_az                      # tek tutar: tam eşleşme
+            bulunan = fatura_ara(kayit["tum"], v_f.get(), v_n.get(), en_az, en_cok)
+            kayit["bulunan"] = {str(x["id"]): x for x in bulunan}
+            agac.delete(*agac.get_children())
+            for sira, x in enumerate(bulunan):
+                agac.insert("", "end", iid=str(x["id"]), tags=("cift",) if sira % 2 else (), values=(
+                    tarih_yaz(x["fatura_tarihi"]), x["fatura_no"], x["firma_adi"], tutar_yaz(x["tutar_haric"]),
+                    x["yapilan_is"] or ""))
+            if bulunan:
+                agac.selection_set(str(bulunan[0]["id"]))
+            v_bilgi.set(hata or ("%d fatura bulundu (toplam %d kayıt)" % (len(bulunan), len(kayit["tum"]))
+                                 if bulunan else "Eşleşen fatura yok (toplam %d kayıt)" % len(kayit["tum"])))
+
+        def yukle(*_):
+            try:
+                kayit["tum"] = db.hepsi()
+            except VeritabaniHatasi as ex:
+                kayit["tum"] = []
+                hata_goster(ex)
+            ara()
+
+        def listede_goster(*_):
+            s = agac.selection()
+            if not s:
+                return
+            x = kayit["bulunan"][s[0]]
+            durum["askida"] = True                  # tek seferde tüm filtreleri ayarla, sonra bir kez yenile
+            try:
+                v_arama.set("")
+                v_firma.set("Tümü")
+                v_bas.set("")
+                v_bit.set("")
+                v_yil.set(x["fatura_tarihi"][:4])
+                v_ay.set(int(x["fatura_tarihi"][5:7]))
+            finally:
+                durum["askida"] = False
+            yenile()
+            if tree.exists(s[0]):
+                tree.selection_set(s[0])
+                tree.focus(s[0])
+                tree.see(s[0])
+            pen.destroy()
+            kok.lift()
+            tree.focus_set()
+
+        def temizle_alanlar():
+            for v in (v_f, v_n, v_a, v_b):
+                v.set("")
+            e_f.focus_set()
+
+        for v in (v_f, v_n, v_a, v_b):
+            v.trace_add("write", ara)
+        alt_k = ttk.Frame(pen, padding=(12, 8, 12, 12))
+        alt_k.pack(fill="x")
+        ttk.Button(alt_k, text="Listede Göster", command=listede_goster).pack(side="left", padx=3)
+        ttk.Button(alt_k, text="Alanları Temizle", command=temizle_alanlar).pack(side="left", padx=3)
+        ttk.Button(alt_k, text="Yenile", command=yukle).pack(side="left", padx=3)
+        ttk.Button(alt_k, text="Kapat", command=pen.destroy).pack(side="right", padx=3)
+        ttk.Label(alt_k, text="Çift tıklama / Enter: ana listede göster", style="Not.TLabel").pack(side="right", padx=12)
+        agac.bind("<Double-1>", listede_goster)
+        agac.bind("<Return>", listede_goster)
+        for e in (e_f, e_n, e_a, e_b):
+            e.bind("<Return>", listede_goster)
+            e.bind("<Down>", lambda ev: (agac.focus_set(), "break")[1])
+        pen.bind("<Escape>", lambda e: pen.destroy())
+        yukle()
+        e_f.focus_set()
 
     def temizle():
         v_arama.set("")
@@ -3565,6 +3728,8 @@ def arayuzu_calistir():
     btn_csv.configure(command=csv_btn)
     btn_satinalma.configure(command=satinalma_btn)
     btn_temizle.configure(command=temizle)
+    btn_bul.configure(command=fatura_bul_penceresi)
+    kok.bind("<Control-f>", fatura_bul_penceresi)
     ipucu_bagla(tree)
     tree.bind("<Double-1>", lambda e: evrak_penceresi())
     tree.bind("<Return>", duzenle)
