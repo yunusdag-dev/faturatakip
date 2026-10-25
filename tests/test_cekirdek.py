@@ -225,6 +225,39 @@ class ExcelCiktisi(unittest.TestCase):
         self.assertTrue(ws["B4"].hyperlink)                            # güvenli türde fatura no bağlantılı
         self.assertIsNone(ws["B5"].hyperlink)                          # .exe'ye bağlantı verilmez
 
+    def test_gizli_karakterle_formul_atlatilamaz(self):
+        """Başa eklenen görünmez karakter temizlenince '=' başa gelirse de hücre formül olmamalı."""
+        import openpyxl
+        d = tempfile.mkdtemp()
+        kotu = chr(11) + "=HYPERLINK(" + chr(34) + "http://x" + chr(34) + ")"
+        for ad, yaz in (("a.xlsx", lambda y: f.xlsx_yaz(y, [fatura(1, firma_adi=kotu, fatura_no=chr(0) + "=1+1")], "T")),
+                        ("s.xlsx", lambda y: f.satinalma_xlsx_yaz(y, [fatura(1, firma_adi=kotu, fatura_no=chr(0) + "=1+1")], "T", "2026"))):
+            y = os.path.join(d, ad)
+            yaz(y)
+            ws = openpyxl.load_workbook(y).active
+            for satir in ws.iter_rows(max_row=400):                   # şablonun boyutu 1 milyon satır görünür; yalnızca veri satırlarına bak
+                for h in satir:
+                    if h.data_type == "f":                                # yalnızca uygulamanın kendi toplam formülleri olabilir
+                        self.assertTrue(str(h.value).startswith(("=SUBTOTAL(", "=SUM(")), "%s %s formül oldu: %r" % (ad, h.coordinate, h.value))
+
+    def test_kirli_metin_disa_aktarmayi_bozmaz(self):
+        import openpyxl
+        d = tempfile.mkdtemp()
+        kirli = fatura(1, yapilan_is="a" + chr(11) + "b" + chr(12) + "c" + chr(31), firma_adi="F" + chr(0) + "irma", fatura_no="x" * 40000)
+        y = os.path.join(d, "k.xlsx")
+        f.satinalma_xlsx_yaz(y, [kirli], "T", "2026")
+        ws = openpyxl.load_workbook(y).active
+        self.assertEqual(ws["G3"].value, "abc")
+        self.assertEqual(ws["H3"].value, "Firma")
+        self.assertLessEqual(len(ws["J3"].value), f.XLSX_HUCRE_EN_UZUN)             # Excel hücre sınırını aşmaz
+        f.csv_yaz(os.path.join(d, "k.csv"), [kirli])                                  # CSV de çökmez
+
+    def test_veritabani_denetim_karakterlerini_temizler(self):
+        db, _ = yeni_db()
+        i = db.ekle(dict(fatura(1), fatura_no="N1", firma_adi="Ali" + chr(11) + "Veli" + chr(10) + "Can", yapilan_is="x" + chr(0) + "y"), "u")
+        r = db.getir(i)
+        self.assertEqual((r["firma_adi"], r["yapilan_is"]), ("Ali Veli Can", "x y"))
+
     def test_satinalma_sablonu_eslesmesi(self):
         import openpyxl
         x = os.path.join(tempfile.mkdtemp(), "s.xlsx")
@@ -236,6 +269,25 @@ class ExcelCiktisi(unittest.TestCase):
         self.assertEqual(ws["D3"].value, ws["F3"].value)               # talep no = belgenet no
         self.assertEqual(ws["H3"].data_type, "s")                      # '=...' firma adı formül olmaz
         self.assertEqual(ws["K4"].value, 1000.02)                      # KDV hariç tutar (TL)
+
+
+def _tk_var():
+    try:
+        import tkinter
+        tkinter.Tk().destroy()
+        return True
+    except Exception:
+        return False
+
+
+@unittest.skipUnless(_tk_var(), "ekran/Tk yok")
+class KendiniSina(unittest.TestCase):
+    def test_kendini_test_hepsi_tamam(self):
+        """Paketlenmiş exe de aynı modla sınanır: FaturaTakip.exe --kendini-test rapor.txt"""
+        rapor = os.path.join(tempfile.mkdtemp(), "r.txt")
+        with self.assertRaises(SystemExit) as c:
+            f.kendini_test(rapor)
+        self.assertEqual(c.exception.code, 0, open(rapor, encoding="utf-8").read())
 
 
 if __name__ == "__main__":

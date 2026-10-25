@@ -35,6 +35,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import zipfile
 import zlib
 import xml.etree.ElementTree as ET
@@ -189,6 +190,28 @@ def tarih_yaz(iso):
         return datetime.strptime(iso[:10], "%Y-%m-%d").strftime("%d.%m.%Y")
     except ValueError:
         return iso
+
+
+_DENETIM_KAR = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+_XLSX_YASAK = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")      # Excel'in hücreye yazılmasını reddettiği karakterler
+XLSX_HUCRE_EN_UZUN = 32000                                          # Excel hücre sınırı 32.767 karakter
+
+
+def temiz_metin(s):
+    """Tek satırlık alan metninden denetim karakterlerini (satır sonu, sekme, dikey sekme, form besleme…) atar ve
+    boşlukları sadeleştirir. PDF/DOCX'ten ya da Word'den yapıştırılan metinde bunlar sık görülür."""
+    if s is None:
+        return None
+    return " ".join(_DENETIM_KAR.sub(" ", str(s)).split())
+
+
+def xlsx_metin(d):
+    """Excel hücresine güvenle yazılabilir değer: yasak karakterleri atar, aşırı uzun metni kısaltır."""
+    if isinstance(d, str):
+        d = _XLSX_YASAK.sub("", d)
+        if len(d) > XLSX_HUCRE_EN_UZUN:
+            d = d[:XLSX_HUCRE_EN_UZUN - 1] + "…"
+    return d
 
 
 def tr_kucuk(s):
@@ -549,6 +572,7 @@ class FaturaDB:
     # -- işlemler ------------------------------------------------------------
     def ekle(self, veri, kullanici):
         simdi = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        veri = {k: (temiz_metin(v) if isinstance(v, str) else v) for k, v in veri.items()}
 
         def f(con):
             self._mukerrer_kontrol(con, veri)
@@ -568,6 +592,7 @@ class FaturaDB:
 
     def guncelle(self, fid, veri, kullanici):
         simdi = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        veri = {k: (temiz_metin(v) if isinstance(v, str) else v) for k, v in veri.items()}
 
         def f(con):
             self._mukerrer_kontrol(con, veri, kendi_id=fid)
@@ -598,6 +623,7 @@ class FaturaDB:
 
     def ek_ekle(self, fid, tur, yol, aciklama, kullanici):
         simdi = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        tur, yol, aciklama = temiz_metin(tur), temiz_metin(yol), temiz_metin(aciklama)
 
         def f(con):
             if con.execute("SELECT 1 FROM ekler WHERE fatura_id=? AND dosya_yolu=?", (fid, yol)).fetchone():
@@ -794,6 +820,7 @@ def _kategori_sayfasi_yaz(ws, satirlar, baslik, st):
                     r.get("talep_no") or "", r.get("talep_eden_birim") or "", r.get("ek_sayisi") or None,
                     r["pdf_yolu"] or ""]
         for k, d in enumerate(degerler, 1):
+            d = xlsx_metin(d)                      # ÖNCE temizle, kontrolü temizlenmiş değerde yap (gizli karakterle atlatılamasın)
             c = ws.cell(row=sat, column=k, value=d)
             if isinstance(d, str) and d.startswith("="):
                 c.data_type = "s"                  # PDF/DOCX'ten gelen '=...' metni formül olarak çalışmasın
@@ -916,6 +943,7 @@ def satinalma_xlsx_yaz(yol, satirlar, baslik, sayfa_adi):
                 d = _excel_sayisi(d) if d else None
             else:
                 d = (d or "").strip() or None
+            d = xlsx_metin(d)                           # ÖNCE temizle, kontrolü temizlenmiş değerde yap
             c = ws.cell(sat, k, value=d)
             if isinstance(d, str) and d.startswith("="):
                 c.data_type = "s"                       # PDF/DOCX'ten gelen '=...' metni formül olarak çalışmasın
@@ -972,8 +1000,10 @@ def ozet_csv_yaz(yol, ozet):
 
 def _csv_guvenli(deger):
     """Excel'in formül sanmaması için =, +, -, @ ile başlayan metnin önüne ' koyar (PDF/DOCX'ten gelen metin olabilir)."""
-    if isinstance(deger, str) and deger[:1] in ("=", "+", "-", "@", "\t", "\r"):
-        return "'" + deger
+    if isinstance(deger, str):
+        deger = _XLSX_YASAK.sub("", deger)
+        if deger[:1] in ("=", "+", "-", "@", "\t", "\r"):
+            return "'" + deger
     return deger
 
 
@@ -2341,6 +2371,23 @@ TEMALAR = {
 UYGULAMA_KIMLIGI = "YunusDag.FaturaTakip"
 
 
+def hata_gunlugu_yolu():
+    return os.path.join(os.path.dirname(_oturum_dosyasi()), "hata.log")
+
+
+def hata_kaydet(metin):
+    """Beklenmeyen hatanın ayrıntısını kullanıcı profilindeki hata.log dosyasına ekler (1 MB'ı aşınca sıfırlar)."""
+    yol = hata_gunlugu_yolu()
+    try:
+        os.makedirs(os.path.dirname(yol), exist_ok=True)
+        if os.path.exists(yol) and os.path.getsize(yol) > 1024 * 1024:
+            os.remove(yol)
+        with open(yol, "a", encoding="utf-8") as f:
+            f.write("=== %s ===\n%s\n" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), metin))
+    except OSError:
+        pass
+
+
 def windows_kimligi_ayarla():
     """Windows'a bu sürecin kendi uygulaması olduğunu bildirir (AppUserModelID). Bu olmadan 'python fatura_takip.py'
     ile açıldığında görev çubuğu pencereyi python.exe'ye bağlar: Python ikonu görünür, alt-tab ve gruplama bozulur."""
@@ -2362,6 +2409,23 @@ def arayuzu_calistir():
 
     windows_kimligi_ayarla()                       # pencere açılmadan ÖNCE: görev çubuğu Python'u değil uygulamayı görsün
     kok = tk.Tk()
+    beklenmeyen = {"acik": False}
+
+    def beklenmeyen_hata(tur, deger, iz):
+        """Düğme/menü işleyicilerinde yakalanmamış hata olursa sessiz kalmasın: günlüğe yaz, kullanıcıya göster."""
+        hata_kaydet("".join(traceback.format_exception(tur, deger, iz)))
+        if beklenmeyen["acik"]:
+            return
+        beklenmeyen["acik"] = True
+        try:
+            messagebox.showerror(UYGULAMA_ADI, "Beklenmeyen bir hata oluştu:\n\n%s: %s\n\nAyrıntı şuraya kaydedildi:\n%s\n\n"
+                                 "İşlem tamamlanmamış olabilir; tekrar deneyin." % (tur.__name__, str(deger)[:300],
+                                                                                    hata_gunlugu_yolu()))
+        except Exception:
+            pass
+        finally:
+            beklenmeyen["acik"] = False
+    kok.report_callback_exception = beklenmeyen_hata
     kok.title(UYGULAMA_ADI)
     kok.geometry("1240x680")
     kok.minsize(980, 520)
@@ -3608,6 +3672,10 @@ def arayuzu_calistir():
             messagebox.showerror(UYGULAMA_ADI, "Dosya yazılamadı. Excel'de açık olabilir; kapatıp tekrar deneyin.", parent=kok)
         except OSError as e:
             hata_goster(e)
+        except Exception as e:
+            hata_kaydet(traceback.format_exc())
+            messagebox.showerror(UYGULAMA_ADI, "Excel/CSV oluşturulamadı:\n%s: %s\n\nAyrıntı: %s"
+                                 % (type(e).__name__, str(e)[:300], hata_gunlugu_yolu()), parent=kok)
 
     def satinalma_btn():
         satirlar = durum.get("gorunen", [])
@@ -3635,6 +3703,10 @@ def arayuzu_calistir():
             messagebox.showerror(UYGULAMA_ADI, "Dosya yazılamadı. Excel'de açık olabilir; kapatıp tekrar deneyin.", parent=kok)
         except (OSError, FileNotFoundError) as e:
             hata_goster(e)
+        except Exception as e:
+            hata_kaydet(traceback.format_exc())
+            messagebox.showerror(UYGULAMA_ADI, "Satınalma Excel'i oluşturulamadı:\n%s: %s\n\nAyrıntı: %s"
+                                 % (type(e).__name__, str(e)[:300], hata_gunlugu_yolu()), parent=kok)
 
     # ---- hesap menüsü eylemleri ------------------------------------------------
     def sifremi_degistir():
@@ -3850,8 +3922,118 @@ def yonetici_kurtarma_komutu():
         print("Hata:", e)
 
 
+def kendini_test(rapor_yolu):
+    """Paketlenmiş exe'nin (ya da kaynak kodun) kendi kendini sınaması: kaynaklar, kütüphaneler, pencere açma,
+    veritabanı, tüm dışa aktarmalar ve PDF okuma geçici bir klasörde denenir; gerçek veriye dokunmaz.
+        FaturaTakip.exe --kendini-test rapor.txt        (sonuç rapor.txt'ye yazılır; çıkış kodu 0 = hepsi tamam)"""
+    satirlar, hatalar = [], []
+    gecici = tempfile.mkdtemp(prefix="fatura_kendini_test_")
+
+    def adim(ad, fonk):
+        try:
+            sonuc = fonk()
+            satirlar.append("OK    %s%s" % (ad, (" -> %s" % sonuc) if sonuc else ""))
+        except Exception:
+            hatalar.append(ad)
+            satirlar.append("HATA  %s\n%s" % (ad, traceback.format_exc()))
+
+    def ortam():
+        return "frozen=%s | python=%s | openpyxl=%s | pymupdf=%s | sv_ttk=%s" % (
+            bool(getattr(sys, "frozen", False)), sys.version.split()[0],
+            getattr(openpyxl, "__version__", None), getattr(fitz, "__doc__", "yok").split()[1] if fitz else None,
+            "var" if sv_ttk else None)
+
+    def kaynaklar():
+        for ad, yol in (("ikon", IKON_YOLU), ("satınalma şablonu", SATINALMA_SABLONU)):
+            if not os.path.exists(yol):
+                raise FileNotFoundError("%s bulunamadı: %s" % (ad, yol))
+
+    def pencere():
+        import tkinter as tk
+        kok = tk.Tk()
+        try:
+            kok.withdraw()
+            if sv_ttk:
+                sv_ttk.set_theme("light")
+            return "Tk %s" % tk.TkVersion
+        finally:
+            kok.destroy()
+
+    kayitlar = []
+
+    def veritabani():
+        db = FaturaDB(os.path.join(gecici, "t.db"))
+        db.ilk_yonetici_olustur("deneme", "deneme-1234")
+        kirli = chr(11) + "=1+1"
+        for i in range(3):
+            db.ekle(dict(fatura_tarihi="2026-10-0%d" % (i + 1), fatura_no="T-%d" % i, firma_adi="Firma" + kirli if i == 0 else "Firma %d" % i,
+                         yapilan_is="İş" + chr(12) + " adı", tutar_haric=100000 + i, pdf_yolu="", kategori="Genel Alım",
+                         talep_no="40355%02d" % i, talep_tarihi="2026-09-29", dt_no="26DT500000%d" % i,
+                         talep_eden_birim="Deneme Birimi"), "deneme")
+        kayitlar.extend(db.hepsi())
+        return "%d kayıt, hesap girişi %s" % (len(kayitlar), "tamam" if db.giris_dene("DENEME", "deneme-1234")[0] else "BAŞARISIZ")
+
+    def disa_aktarma():
+        if openpyxl is None:
+            raise RuntimeError("openpyxl yok")
+        a, b, c = (os.path.join(gecici, x) for x in ("a.xlsx", "s.xlsx", "c.csv"))
+        xlsx_yaz(a, kayitlar, "Deneme")
+        satinalma_xlsx_yaz(b, kayitlar, "2026 EKİM HARCAMA LİSTESİ", "2026")
+        csv_yaz(c, kayitlar)
+        ws = openpyxl.load_workbook(b).active
+        if not ws["H3"].value or ws["D3"].value != ws["F3"].value:
+            raise ValueError("satınalma çıktısı beklenen biçimde değil")
+        for x in (a, b):
+            for satir in openpyxl.load_workbook(x).active.iter_rows(max_row=400):
+                for h in satir:
+                    if h.data_type == "f" and not str(h.value).startswith(("=SUBTOTAL(", "=SUM(")):
+                        raise ValueError("formül enjeksiyonu: %s %r" % (h.coordinate, h.value))
+        return "Excel, Satınalma, CSV"
+
+    def pdf_okuma():
+        pdf = os.path.join(gecici, "d.pdf")
+        icerik = b"BT /F1 12 Tf 72 720 Td (Fatura Tarihi: 04.06.2026) Tj ET"
+        satirlar_pdf = [b"%PDF-1.4",
+                        b"1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj",
+                        b"2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj",
+                        b"3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R "
+                        b"/Resources << /Font << /F1 5 0 R >> >> >> endobj",
+                        b"4 0 obj << /Length " + str(len(icerik)).encode() + b" >>",
+                        b"stream",
+                        icerik,
+                        b"endstream endobj",
+                        b"5 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj",
+                        b"trailer << /Root 1 0 R >>",
+                        b"%EOF"]
+        govde = b"\n".join(satirlar_pdf) + b"\n"
+        with open(pdf, "wb") as fh:
+            fh.write(govde)
+        metin = " ".join(pdf_sayfa_metinleri(pdf)[0])
+        mupdf = "PyMuPDF" if fitz else "yerleşik okuyucu"
+        if "04.06.2026" not in metin:
+            raise ValueError("PDF metni okunamadı: %r" % metin[:80])
+        pdf_bilgi_cikar(pdf, {"kurum_anahtar": "", "kurum_vkn": ""})
+        return mupdf
+
+    for ad, fonk in (("ortam", ortam), ("kaynak dosyaları (ikon, şablon)", kaynaklar), ("pencere açma ve tema", pencere),
+                     ("veritabanı, hesap, kirli veri temizliği", veritabani), ("dışa aktarmalar", disa_aktarma),
+                     ("PDF okuma", pdf_okuma)):
+        adim(ad, fonk)
+    satirlar.append("")
+    satirlar.append("SONUÇ: %s" % ("HEPSİ TAMAM" if not hatalar else "BAŞARISIZ: " + ", ".join(hatalar)))
+    try:
+        with open(rapor_yolu, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(satirlar) + "\n")
+    finally:
+        shutil.rmtree(gecici, ignore_errors=True)
+    sys.exit(1 if hatalar else 0)
+
+
 if __name__ == "__main__":
-    if "--yonetici-sifirla" in sys.argv:
+    if "--kendini-test" in sys.argv:
+        i = sys.argv.index("--kendini-test")
+        kendini_test(sys.argv[i + 1] if i + 1 < len(sys.argv) else os.path.join(tempfile.gettempdir(), "fatura_kendini_test.txt"))
+    elif "--yonetici-sifirla" in sys.argv:
         yonetici_kurtarma_komutu()
     else:
         while arayuzu_calistir():
