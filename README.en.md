@@ -121,7 +121,7 @@ Example: [config.ornek.ini](config.ornek.ini)
 |---|---|
 | `veritabani` | Database path (UNC for a network; do not use drive letters) |
 | `tarama_klasoru` | First folder shown by the PDF "Browse" dialog |
-| `tema` | Açık / Koyu / Mavi / Yeşil / Mor / Turuncu / Kırmızı (Light / Dark / Blue / Green / Purple / Orange / Red) |
+| `tema` | Default theme for new accounts: Açık / Koyu / Mavi / Yeşil / Mor / Turuncu / Kırmızı (Light / Dark / Blue / Green / Purple / Orange / Red). Everyone picks their own under **View > Theme** (*Görünüm > Tema*); the choice is saved to their own account and does not affect anyone else. |
 | `kurum_anahtar` | Words from your own organisation's name, so that the recipient is not mistaken for the supplier in a PDF |
 | `kurum_vkn` | Your own organisation's tax number |
 

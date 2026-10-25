@@ -134,6 +134,30 @@ class Hesaplar(unittest.TestCase):
         self.assertEqual(self.db.giris_dene("y", "gizli1234")[0]["aktif"], 1)     # işlem geri alındı
 
 
+class TemaHesabaOzel(unittest.TestCase):
+    def test_tema_her_kullanicinin_kendi_hesabinda(self):
+        db, _ = yeni_db()
+        db.ilk_yonetici_olustur("Y", "gizli1234")
+        db.kullanici_ekle("Ayse", "gecici1234", sifre_degismeli=False)
+        y = db.giris_dene("y", "gizli1234")[0]
+        a = db.giris_dene("ayse", "gecici1234")[0]
+        self.assertIsNone(y["tema"])                                   # seçim yoksa varsayılan (config.ini) kullanılır
+        db.kullanici_tema_yaz(a["id"], "Mor")
+        self.assertEqual(db.giris_dene("ayse", "gecici1234")[0]["tema"], "Mor")
+        self.assertIsNone(db.giris_dene("y", "gizli1234")[0]["tema"])   # başkasının seçimi diğerini etkilemez
+
+    def test_eski_veritabanina_tema_sutunu_eklenir(self):
+        yol = os.path.join(tempfile.mkdtemp(), "eski.db")
+        con = sqlite3.connect(yol)
+        con.execute("CREATE TABLE kullanicilar (id INTEGER PRIMARY KEY AUTOINCREMENT, kullanici_adi TEXT NOT NULL, "
+                    "kullanici_anahtar TEXT NOT NULL UNIQUE, sifre TEXT NOT NULL, yonetici INTEGER NOT NULL DEFAULT 0, "
+                    "aktif INTEGER NOT NULL DEFAULT 1, sifre_degismeli INTEGER NOT NULL DEFAULT 0, olusturma_tarihi TEXT)")
+        con.commit(); con.close()
+        f.FaturaDB(yol)                                                # açılışta şema yükseltilir
+        sutunlar = [x[1] for x in sqlite3.connect(yol).execute("PRAGMA table_info(kullanicilar)")]
+        self.assertIn("tema", sutunlar)
+
+
 class Arama(unittest.TestCase):
     def test_fatura_ara(self):
         tum = [fatura(1, firma_adi="ALE YÜK A.Ş.", fatura_no="ALE-001", tutar_haric=3250000),

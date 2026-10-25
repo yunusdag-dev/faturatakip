@@ -122,7 +122,7 @@ Exe üretmek için bir kez `pip install pyinstaller` yapın, ardından [derle.ba
 |---|---|
 | `veritabani` | Veritabanı yolu (ağ için UNC; sürücü harfi kullanmayın) |
 | `tarama_klasoru` | PDF "Gözat" penceresinin ilk klasörü |
-| `tema` | Açık / Koyu / Mavi / Yeşil / Mor / Turuncu / Kırmızı |
+| `tema` | Yeni hesapların varsayılan teması (Açık / Koyu / Mavi / Yeşil / Mor / Turuncu / Kırmızı). Herkes **Görünüm > Tema**'dan kendi temasını seçer; seçim kendi hesabına kaydedilir, başkasını etkilemez. |
 | `kurum_anahtar` | Kendi kurumunuzun adından kelimeler; PDF'te alıcıyı firma sanmasın diye |
 | `kurum_vkn` | Kendi kurumunuzun vergi numarası |
 

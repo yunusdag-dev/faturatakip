@@ -11,7 +11,7 @@ Ayarlar: Programla aynı klasördeki config.ini dosyası.
   [ayarlar]
   veritabani = fatura.db                     ; ağ için: \\sunucu\paylasim\FaturaTakip\fatura.db
   tarama_klasoru =                           ; PDF "Gözat" penceresinin ilk açılacağı klasör (isteğe bağlı)
-  tema = Açık                                ; Açık / Koyu / Mavi / Yeşil / Mor / Turuncu / Kırmızı (menüden de değiştirilir)
+  tema = Açık                                ; yeni hesapların varsayılan teması; herkes menüden kendi temasını seçer (hesabına kaydedilir)
   kurum_anahtar =                            ; kendi kurumunuzun adından kelime(ler), virgülle (PDF'te alıcıyı firma sanmasın)
   kurum_vkn =                                ; kendi kurumunuzun vergi numarası (isteğe bağlı)
 
@@ -404,6 +404,8 @@ class FaturaDB:
                     sifre_degismeli INTEGER NOT NULL DEFAULT 0,
                     olusturma_tarihi TEXT
                 )""")
+            if "tema" not in [x[1] for x in con.execute("PRAGMA table_info(kullanicilar)")]:
+                con.execute("ALTER TABLE kullanicilar ADD COLUMN tema TEXT")      # her kullanıcı kendi temasını seçer
             con.execute("""
                 CREATE TABLE IF NOT EXISTS oturumlar (
                     anahtar_hash TEXT PRIMARY KEY,
@@ -511,6 +513,10 @@ class FaturaDB:
             if not con.execute("SELECT 1 FROM kullanicilar WHERE yonetici=1 AND aktif=1").fetchone():
                 raise VeritabaniHatasi("En az bir aktif yönetici kalmalı.")
         self._calistir(f)
+
+    def kullanici_tema_yaz(self, kid, tema):
+        """Kullanıcının seçtiği tema yalnızca kendi hesabına kaydedilir."""
+        self._calistir(lambda con: con.execute("UPDATE kullanicilar SET tema=? WHERE id=?", (tema, kid)))
 
     def yonetici_kurtar(self, ad, sifre):
         """Komut satırı kurtarması: hesabı yoksa açar; varsa yönetici + aktif yapıp şifresini yeniler."""
@@ -2388,6 +2394,54 @@ def hata_kaydet(metin):
         pass
 
 
+def pencere_sahibi_ata(pen, sahip):
+    """Pencereyi Windows düzeyinde 'sahip' pencereye bağlar (owned window), tıpkı yerel Windows diyalogları gibi:
+    sahip küçülünce Windows pencereyi de saklar, geri yüklenince geri gösterir; pencere her zaman sahibinin üstünde kalır
+    ve görev çubuğunda ayrı düğmesi olmaz. Tk'nin kendi `transient` mekanizması bu sürümde küçült / geri yükle sonrası
+    pencereyi geri getirmediği için (pencere kaybolur) kullanılmaz. Tk, pencere özelliklerini değiştirirken dış çerçeveyi
+    yeniden oluşturabildiğinden bağ, pencere her göründüğünde tekrar (idempotent) uygulanır."""
+    if os.name != "nt":
+        pen.transient(sahip)
+        return
+    try:
+        import ctypes
+        u = ctypes.windll.user32
+        u.GetParent.restype = ctypes.c_void_p
+        u.GetParent.argtypes = [ctypes.c_void_p]
+        u.GetWindowLongPtrW.restype = ctypes.c_void_p
+        u.GetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        u.SetWindowLongPtrW.restype = ctypes.c_void_p
+        u.SetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+        u.GetWindowLongW.restype = ctypes.c_long
+        u.GetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        u.SetWindowLongW.restype = ctypes.c_long
+        u.SetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_long]
+        u.SetWindowPos.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                   ctypes.c_uint]
+    except Exception:
+        pen.transient(sahip)
+        return
+
+    def uygula(_olay=None):
+        try:
+            if not pen.winfo_exists() or not sahip.winfo_exists():
+                return
+            h = u.GetParent(pen.winfo_id())                  # Tk'nin dış çerçeve penceresi (henüz yoksa 0)
+            hs = u.GetParent(sahip.winfo_id()) or sahip.winfo_id()
+            if not h:
+                return
+            if u.GetWindowLongPtrW(h, -8) != hs:             # GWLP_HWNDPARENT = sahip
+                u.SetWindowLongPtrW(h, -8, hs)
+            st = u.GetWindowLongW(h, -16)                    # GWL_STYLE
+            if st & 0x20000:                                 # WS_MINIMIZEBOX: sahipli pencere ayrı küçültülmez
+                u.SetWindowLongW(h, -16, st & ~0x20000)
+                u.SetWindowPos(h, None, 0, 0, 0, 0, 0x27)    # NOSIZE|NOMOVE|NOZORDER|FRAMECHANGED
+        except Exception:
+            pass
+    pen.bind("<Map>", lambda e: uygula() if e.widget is pen else None, add="+")
+    uygula()
+
+
 def windows_kimligi_ayarla():
     """Windows'a bu sürecin kendi uygulaması olduğunu bildirir (AppUserModelID). Bu olmadan 'python fatura_takip.py'
     ile açıldığında görev çubuğu pencereyi python.exe'ye bağlar: Python ikonu görünür, alt-tab ve gruplama bozulur."""
@@ -2448,6 +2502,14 @@ def arayuzu_calistir():
     tema = {"ad": "Açık", "r": TEMALAR["Açık"]}
     v_tema = tk.StringVar(value=ayar["tema"] if ayar["tema"] in TEMALAR else "Açık")
 
+    def tema_kaydet(ad):
+        """config.ini'deki tema yalnızca yeni hesapların varsayılanıdır; seçim giriş yapan kullanıcının hesabına yazılır."""
+        try:
+            if oturum.get("id"):
+                db.kullanici_tema_yaz(oturum["id"], ad)
+        except VeritabaniHatasi:
+            pass
+
     def tema_uygula(ad, kaydet=False):
         if ad not in TEMALAR:
             ad = "Açık"
@@ -2469,7 +2531,7 @@ def arayuzu_calistir():
                 if isinstance(w, tk.Toplevel):
                     w.configure(bg=r["bg"])
             if kaydet:
-                ayar_yaz(CONFIG_YOLU, "tema", ad)
+                tema_kaydet(ad)
             return
         try:
             stil.theme_use("clam")
@@ -2513,7 +2575,7 @@ def arayuzu_calistir():
                     if isinstance(t, tk.Text):
                         t.configure(bg=r["alan"], fg=r["fg"], insertbackground=r["fg"])
         if kaydet:
-            ayar_yaz(CONFIG_YOLU, "tema", ad)
+            tema_kaydet(ad)
 
     tema_uygula(v_tema.get())
 
@@ -2521,8 +2583,59 @@ def arayuzu_calistir():
         p = tk.Toplevel(kok)
         p.title(baslik)
         p.configure(bg=tema["r"]["bg"])
-        p.transient(kok)
+        pencere_sahibi_ata(p, kok)
         return p
+
+    # ---- modal pencereler ve küçült / geri yükle --------------------------------------
+    modal_yigin = []
+
+    def modal_yap(pen):
+        """Pencereyi modal yapar (Tk kilidi). Kilit, ana pencere küçülünce bırakılır, geri yüklenince yeniden alınır:
+        Tk, kilit varken Windows'un küçült / geri yükle komutlarını da yok sayar; kilit bırakılmazsa küçültülen uygulama
+        görev çubuğundan ya da Alt+Tab ile geri getirilemez ve 'kilitlenmiş' gibi görünür."""
+        pen.grab_set()
+        modal_yigin.append(pen)
+        pen.bind("<Destroy>", lambda e, p=pen: modal_yigin.remove(p) if e.widget is p and p in modal_yigin else None, add="+")
+
+    gizlenen = []                              # ana pencere küçülürken elle saklanan iç içe modal pencereler
+
+    def modal_geri_al(deneme=0):
+        modal_yigin[:] = [p for p in modal_yigin if p.winfo_exists()]
+        if not modal_yigin or kok.state() in ("iconic", "withdrawn"):
+            return
+        for g in list(gizlenen):               # iç içe modal pencereleri (sahipleri geri geldikten sonra) yeniden göster
+            gizlenen.remove(g)
+            try:
+                if g.winfo_exists():
+                    g.deiconify()
+            except tk.TclError:
+                pass
+        p = modal_yigin[-1]
+        if p.winfo_viewable():
+            p.lift()
+            p.grab_set()
+            p.focus_set()
+        elif deneme < 12:                      # Windows sahipli pencereyi geri gösterene kadar kısa süre bekle
+            kok.after(150, lambda: modal_geri_al(deneme + 1))
+
+    def ana_kuculdu(olay):
+        if olay.widget is kok:
+            for p in list(modal_yigin):
+                try:
+                    p.grab_release()
+                except tk.TclError:
+                    pass
+            for p in modal_yigin[1:]:          # iç içe modal: Windows yalnızca doğrudan sahipli pencereleri saklar
+                try:
+                    if p.winfo_viewable():
+                        p.withdraw()
+                        gizlenen.append(p)
+                except tk.TclError:
+                    pass
+
+    kok.bind("<Unmap>", ana_kuculdu, add="+")
+    kok.bind("<Map>", lambda e: kok.after(150, modal_geri_al) if e.widget is kok else None, add="+")
+    kok.bind("<FocusIn>", lambda e: modal_geri_al() if e.widget is kok else None, add="+")      # güvenlik ağı
 
     def arka_planda(is_fonk, bitince):
         """Uzun işi (PDF okuma) ayrı iş parçacığında yapar; arayüz donmaz. bitince(değer, hata) ana iş parçacığında çağrılır."""
@@ -2558,7 +2671,7 @@ def arayuzu_calistir():
         pen.configure(bg=tema["r"]["bg"])
         pen.resizable(False, False)
         if ana is not None:
-            pen.transient(ana)
+            pencere_sahibi_ata(pen, ana)
         cerceve = ttk.Frame(pen, padding=16)
         cerceve.pack()
         sat = 0
@@ -2607,7 +2720,7 @@ def arayuzu_calistir():
         pen.geometry("+%d+%d" % ((pen.winfo_screenwidth() - pen.winfo_reqwidth()) // 2,
                                  (pen.winfo_screenheight() - pen.winfo_reqheight()) // 3))
         pen.wait_visibility()
-        pen.grab_set()
+        modal_yap(pen)
         girisler[0].focus_set()
         kok.wait_window(pen)
         return sonuc.get("deger")
@@ -2693,13 +2806,16 @@ def arayuzu_calistir():
         except VeritabaniHatasi as e:
             messagebox.showerror(UYGULAMA_ADI, str(e))
             return False
-        oturum.update(id=k["id"], ad=k["kullanici_adi"], yonetici=bool(k["yonetici"]), token=token)
+        oturum.update(id=k["id"], ad=k["kullanici_adi"], yonetici=bool(k["yonetici"]), token=token, tema=k.get("tema"))
         return True
 
     if not giris_yap():
         kok.destroy()
         return False
     kullanici = oturum["ad"]
+    if oturum.get("tema") in TEMALAR and oturum["tema"] != tema["ad"]:
+        v_tema.set(oturum["tema"])
+        tema_uygula(oturum["tema"])          # arayüz bileşenleri bundan sonra kurulduğu için doğru renklerle açılır
 
     # ---- durum ---------------------------------------------------------------
     durum = {"satirlar": [], "gorunen": [], "sirala": ("fatura_tarihi", True)}
@@ -3077,6 +3193,7 @@ def arayuzu_calistir():
         agac.bind("<Motion>", hareket, add="+")
         for olay in ("<Leave>", "<ButtonPress>", "<MouseWheel>", "<Key>"):
             agac.bind(olay, ayril, add="+")
+        agac.winfo_toplevel().bind("<Unmap>", ayril, add="+")           # pencere küçülürse açık balon kapanır
 
     def secili_id():
         s = tree.selection()
@@ -3118,7 +3235,7 @@ def arayuzu_calistir():
             yenile()
             return
         pen = yeni_pencere("Kayıt Düzenle" if fid else "Yeni Kayıt")
-        pen.grab_set()
+        modal_yap(pen)
         pen.resizable(False, False)
 
         v = {
@@ -3492,7 +3609,7 @@ def arayuzu_calistir():
             return
         pen = yeni_pencere("Evraklar  -  %s  /  %s" % (fatura["firma_adi"], fatura["fatura_no"]))
         pen.geometry("860x420")
-        pen.grab_set()
+        modal_yap(pen)
         satirlar = {}                       # iid -> (yol, ek_id veya None)
 
         ttk.Label(pen, text="%s   |   %s   |   %s" % (fatura["firma_adi"], fatura["fatura_no"],
@@ -3733,7 +3850,7 @@ def arayuzu_calistir():
     def kullanicilar_penceresi():
         pen = yeni_pencere("Kullanıcılar")
         pen.geometry("620x380")
-        pen.grab_set()
+        modal_yap(pen)
         agac = ttk.Treeview(pen, columns=("ad", "rol", "durum"), show="headings", selectmode="browse")
         for ad, baslik, gen in (("ad", "Kullanıcı Adı", 250), ("rol", "Yetki", 110), ("durum", "Durum", 190)):
             agac.heading(ad, text=baslik)
@@ -3880,22 +3997,6 @@ def arayuzu_calistir():
     kok.title("%s   -   %s%s" % (UYGULAMA_ADI, kullanici, "  (Yönetici)" if oturum["yonetici"] else ""))
     yenile()
 
-    def modal_one_getir(e=None):
-        """Ana pencere yeniden etkin olunca (alt-tab, görev çubuğu, küçültüp açma) odağı tutan modal pencere
-        (form, evrak, kullanıcılar...) arkada kalmışsa öne getirir; yoksa uygulama tıklanamaz/kilitli görünür."""
-        if e is not None and e.widget is not kok:
-            return
-        try:
-            g = kok.grab_current()
-            if g is not None and g is not kok and g.winfo_exists():
-                g.deiconify()
-                g.lift()
-                g.focus_set()
-        except tk.TclError:
-            pass
-    kok.bind("<FocusIn>", modal_one_getir, add="+")
-    kok.bind("<Map>", modal_one_getir, add="+")
-
     kok.deiconify()
     kok.lift()
     kok.focus_force()                  # giriş penceresinden sonra ana pencere ön planda ve odakta açılsın
@@ -3959,6 +4060,32 @@ def kendini_test(rapor_yolu):
         finally:
             kok.destroy()
 
+    def pencere_sahipligi():
+        """Windows sahiplik bağı (küçült / geri yükle düzeltmesi) paketlenmiş exe'de de çalışıyor mu?"""
+        if os.name != "nt":
+            return "Windows değil, atlandı"
+        import ctypes
+        import tkinter as tk
+        kok = tk.Tk()
+        try:
+            kok.geometry("200x100+50+50")
+            kok.update()
+            pen = tk.Toplevel(kok)
+            pencere_sahibi_ata(pen, kok)
+            pen.update()
+            u = ctypes.windll.user32
+            u.GetParent.restype = ctypes.c_void_p
+            u.GetParent.argtypes = [ctypes.c_void_p]
+            u.GetWindowLongPtrW.restype = ctypes.c_void_p
+            u.GetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            sahip = u.GetWindowLongPtrW(u.GetParent(pen.winfo_id()), -8)
+            beklenen = u.GetParent(kok.winfo_id()) or kok.winfo_id()
+            if sahip != beklenen:
+                raise RuntimeError("pencere sahibi atanamadı (sahip=%s beklenen=%s)" % (sahip, beklenen))
+            return "sahiplik bağı kuruldu"
+        finally:
+            kok.destroy()
+
     kayitlar = []
 
     def veritabani():
@@ -4015,7 +4142,7 @@ def kendini_test(rapor_yolu):
         pdf_bilgi_cikar(pdf, {"kurum_anahtar": "", "kurum_vkn": ""})
         return mupdf
 
-    for ad, fonk in (("ortam", ortam), ("kaynak dosyaları (ikon, şablon)", kaynaklar), ("pencere açma ve tema", pencere),
+    for ad, fonk in (("ortam", ortam), ("kaynak dosyaları (ikon, şablon)", kaynaklar), ("pencere açma ve tema", pencere), ("pencere sahipliği (küçült/geri yükle)", pencere_sahipligi),
                      ("veritabanı, hesap, kirli veri temizliği", veritabani), ("dışa aktarmalar", disa_aktarma),
                      ("PDF okuma", pdf_okuma)):
         adim(ad, fonk)
