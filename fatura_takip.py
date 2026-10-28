@@ -236,7 +236,7 @@ class MukerrerKayit(VeritabaniHatasi):
 
 
 # ---- kullanıcı hesapları: şifre hash'leme ve "beni hatırla" oturum dosyası ---------------------
-SIFRE_EN_AZ = 8
+SIFRE_EN_AZ = 6
 KULLANICI_ADI_EN_UZUN = 40
 OTURUM_GUN = 90                       # "beni hatırla" anahtarının geçerlilik süresi
 _PBKDF2_TUR = 600_000                 # OWASP önerisi (PBKDF2-HMAC-SHA256); eski hash'ler kendi tur sayısıyla doğrulanır
@@ -2079,16 +2079,63 @@ def docx_satirlari(yol):
     return satirlar
 
 
+_AYRAC_SATIRI = re.compile(r"^[\s:：\-–—=.]*$")          # yalnızca ':' gibi ayraçlardan oluşan satır
+_AYRAC_KARAKTERLERI = " \t:：-–—="
+
+
+def _etiketle_baslayan(satir, etiket):
+    """Satırın metni (boşluklar sadeleştirilmiş, büyük-küçük harf ve Türkçe İ/ı farkı önemsiz) etiketle başlıyorsa,
+    etiketten sonraki kalan metni (ayraçlar ve baştaki boşluklar atılmış) döndürür; başlamıyorsa None."""
+    norm = " ".join(satir.split())
+    kucuk = norm.replace("İ", "i").replace("I", "ı").lower()
+    e = " ".join(etiket.split()).replace("İ", "i").replace("I", "ı").lower()
+    if not kucuk.startswith(e):
+        return None
+    return norm[len(e):].strip(_AYRAC_KARAKTERLERI)
+
+
 def _etiket_sonrasi(satirlar, etiket):
-    """Etiket satırının hemen altındaki (ya da 'Etiket: değer' biçiminde aynı satırdaki) değeri döndürür."""
-    e = tr_kucuk(etiket)
+    """Etiketle başlayan satırın değerini döndürür: aynı satırda 'Etiket: değer' biçiminde ya da (etiket / ':' / değer gibi
+    ayrı satırlarda) etiketten sonraki ilk anlamlı satırda. ':' gibi ayraç satırları atlanır."""
     for i, satir in enumerate(satirlar):
-        k = tr_kucuk(satir).rstrip(" :")
-        if k == e:
-            return satirlar[i + 1] if i + 1 < len(satirlar) else None
-        if k.startswith(e) and ":" in satir[len(etiket):len(etiket) + 3]:
-            return satir.split(":", 1)[1].strip() or None
+        kalan = _etiketle_baslayan(satir, etiket)
+        if kalan is None:
+            continue
+        if kalan:
+            return kalan
+        for sonraki in satirlar[i + 1:i + 4]:
+            if not _AYRAC_SATIRI.match(sonraki):
+                return sonraki
+        return None
     return None
+
+
+_DT_DESENI = re.compile(r"\b\d{2}DT\d{5,}\b", re.I)
+DT_ETIKETI = "Doğrudan Temin Numarası"
+
+
+def dt_numarasi_coz(satirlar):
+    """DT numarasını, metni 'Doğrudan Temin Numarası' ile başlayan satıra göre okur; satırın belgedeki sırası önemsizdir.
+    Numara önce o satırda aranır ('Doğrudan Temin Numarası: 26DT5011403'); orada yoksa etiketten sonraki birkaç satırda
+    (etiket / ':' / numara gibi ayrı satır ya da hücrelerde). Bulunamazsa None."""
+    for i, satir in enumerate(satirlar):
+        kalan = _etiketle_baslayan(satir, DT_ETIKETI)
+        if kalan is None:
+            continue
+        for aday in [kalan] + list(satirlar[i + 1:i + 5]):
+            m = _DT_DESENI.search(aday)
+            if m:
+                return m.group(0).upper()
+    return None
+
+
+def kural_dt_docx(yol, secenek):
+    satirlar = docx_satirlari(yol)
+    deger = dt_numarasi_coz(satirlar)
+    if not deger:                                   # etiket satırı yoksa belgede geçen ilk DT numarası (ör. 'Alım Kaydı' başlığı)
+        m = _DT_DESENI.search("\n".join(satirlar))
+        deger = m.group(0).upper() if m else None
+    return deger, ("" if deger else "Belgede '%s' satırı ya da DT numarası bulunamadı." % DT_ETIKETI)
 
 
 def kural_docx_etiket(etiket, desen=None):
@@ -2103,7 +2150,24 @@ def kural_docx_etiket(etiket, desen=None):
     return kural
 
 
+_ILK_SAYFA_ONBELLEK = {}                   # (yol, değişiklik zamanı, boyut) -> ilk sayfa metni; en çok 8 dosya
+
+
 def _ilk_sayfa_metni(yol):
+    """PDF'in ilk sayfasının metni. Aynı dosya art arda (ör. talep no, birim ve işin adı birlikte doldurulurken) istenirse
+    bir kez okunur; dosya değişirse (zaman/boyut) yeniden okunur."""
+    try:
+        anahtar = (os.path.abspath(yol), os.path.getmtime(yol), os.path.getsize(yol))
+    except OSError:
+        return _ilk_sayfa_metni_oku(yol)
+    if anahtar not in _ILK_SAYFA_ONBELLEK:
+        if len(_ILK_SAYFA_ONBELLEK) >= 8:
+            _ILK_SAYFA_ONBELLEK.pop(next(iter(_ILK_SAYFA_ONBELLEK)))
+        _ILK_SAYFA_ONBELLEK[anahtar] = _ilk_sayfa_metni_oku(yol)
+    return _ILK_SAYFA_ONBELLEK[anahtar]
+
+
+def _ilk_sayfa_metni_oku(yol):
     sayfalar, _ = pdf_sayfa_metinleri_mupdf(yol, 1)
     if not sayfalar or len(sayfalar[0].strip()) < 40:
         try:
@@ -2194,95 +2258,6 @@ def kural_birim_pdf(yol, secenek):
     return birim_coz(_ilk_sayfa_metni(yol))
 
 
-_IS_BASLIK_ONEKI = re.compile(r"^(hizmet|malzeme)", re.I)
-
-
-def _kenar_cizgileri(sayfa):
-    """Sayfadaki tablo çizgileri -> ([(x, y0, y1) dikey çizgiler], [(y, x0, x1) yatay çizgiler])."""
-    dikey, yatay = [], []
-    try:
-        cizimler = sayfa.get_drawings()
-    except Exception:
-        return dikey, yatay
-    for d in cizimler:
-        r = d["rect"]
-        if r.width < 2 and r.height > 8:
-            dikey.append(((r.x0 + r.x1) / 2, r.y0, r.y1))
-        elif r.height < 2 and r.width > 8:
-            yatay.append(((r.y0 + r.y1) / 2, r.x0, r.x1))
-    return dikey, yatay
-
-
-def is_adi_pdf_tablodan(yol):
-    """Ihtiyaç Formu'ndaki 'HİZMETİN / MALZEMENİN ADI VE KARAKTERİSTİĞİ' başlığının hemen altındaki hücrenin metni.
-    Tablo çizgilerinden başlığın sütunu ve altındaki hücre bulunur (PyMuPDF gerekir); bulunamazsa None."""
-    if fitz is None:
-        return None
-    try:
-        with fitz.open(yol) as belge:
-            if belge.needs_pass or not len(belge):
-                return None
-            sayfa = belge[0]
-            kelimeler = sayfa.get_text("words")
-            dikey, yatay = _kenar_cizgileri(sayfa)
-    except Exception:
-        return None
-    if not dikey:
-        return None
-    for kar in kelimeler:
-        if not tr_kucuk(kar[4]).startswith("karakteristi"):
-            continue
-        # başlığın ilk satırı: hemen üstteki '<Hizmetin|Malzemenin> ADI VE' satırı
-        ust = [w for w in kelimeler if 0 < kar[1] - w[1] < 20 and abs(w[0] - kar[0]) < 150]
-        if not any(tr_kucuk(w[4]) == "adı" for w in ust) or not any(_IS_BASLIK_ONEKI.match(w[4]) for w in ust):
-            continue
-        cx = (kar[0] + kar[2]) / 2
-        sol = max([x for x, y0, y1 in dikey if x < cx - 1 and y0 <= kar[1] + 1 and y1 >= kar[3] - 1], default=None)
-        sag = min([x for x, y0, y1 in dikey if x > cx + 1 and y0 <= kar[1] + 1 and y1 >= kar[3] - 1], default=None)
-        if sol is None or sag is None:
-            continue
-        yler = sorted(y for y, x0, x1 in yatay if x0 <= cx <= x1 and y >= kar[3] - 1)
-        if not yler:
-            continue
-        bas = yler[0]                                    # başlık hücresinin alt kenarı
-        bit = next((y for y in yler if y > bas + 3), bas + 150)
-        satirlar = {}
-        for w in kelimeler:
-            mx, my = (w[0] + w[2]) / 2, (w[1] + w[3]) / 2
-            if sol < mx < sag and bas < my < bit:
-                satirlar.setdefault(round(my / 4), []).append(w)
-        metin = " ".join(" ".join(x[4] for x in sorted(s, key=lambda x: x[0]))
-                         for _, s in sorted(satirlar.items()))
-        return " ".join(metin.split()) or None
-    return None
-
-
-_IS_DURDUR = re.compile(r"^\d+\s*(adet|ad\.?)?$|\d{1,2}[/.]\d{1,2}[/.]\d{4}|tarih|imza|ihtiyaç sahibi|alt birim|stok|"
-                        r"adı soyadı|ünvan", re.I)
-_IS_MIKTAR = re.compile(r"\s+\d+\s*(?:adet|ad\.?)\b(\s+\d+)*", re.I)
-_IS_BASLIK_ARTIGI = re.compile(r"^(kodu|birimi|miktar[ıi]?|miktar|\(varsa\)|proje kodu|karakteristi.*|"
-                               r"(hizmet|malzeme)\w*\s+ad[ıi]\s+ve)$", re.I)
-
-
-def is_adi_pdf_metinden(metin):
-    """Tablo çizgisi okunamadığında (taranmış PDF / PyMuPDF yok): 'KARAKTERİSTİĞİ' başlığından sonraki satırlar,
-    başlığın yan sütun başlıkları atlanıp miktar/tarih/imza satırına gelene kadar alınır."""
-    satirlar = [s.strip() for s in (metin or "").splitlines() if s.strip()]
-    for i, s in enumerate(satirlar):
-        if not tr_kucuk(s).startswith("karakteristi"):
-            continue
-        sonuc = []
-        for t in satirlar[i + 1:i + 12]:
-            if not sonuc and _IS_BASLIK_ARTIGI.match(t.strip()):
-                continue
-            if _IS_DURDUR.search(t):
-                break
-            sonuc.append(_IS_MIKTAR.sub("", t))        # satır içindeki '1 Adet' miktar sütunu karışmasın
-        if sonuc:
-            return " ".join(" ".join(sonuc).split())
-    return None
-
-
 _SONDAKI_PARANTEZ = re.compile(r"\s*\([^()]*\)\s*$")
 
 
@@ -2295,20 +2270,71 @@ def is_adi_parantez_at(ad):
     return sade or ad
 
 
+IS_ADI_ETIKETI = "TALEBİN ADI, NİTELİĞİ VE MİKTARI"
+_TARIH_SATIRI = re.compile(r"^\s*\d{1,2}\s*[./-]\s*\d{1,2}\s*[./-]\s*\d{4}\s*$")
+_ASCII_TABLO = str.maketrans("çğıöşüÇĞİÖŞÜIâîû", "cgiosucgiosuiaiu")
+
+
+def _harf_ozu(s):
+    """Karşılaştırma için: Türkçe harfler sadeleştirilir (İ/I/ı hepsi i), küçük harf, yalnızca harf ve rakam kalır."""
+    return re.sub(r"[^a-z0-9]", "", (s or "").translate(_ASCII_TABLO).lower())
+
+
+def _etiket_kalani(satir, etiket):
+    """Satır etiketle başlıyorsa (boşluk, noktalama, büyük-küçük harf ve Türkçe karakter farkı önemsiz) etiketten sonraki
+    metni (baştaki ':' gibi ayraçlar atılmış) döndürür; başlamıyorsa None."""
+    hedef = _harf_ozu(etiket)
+    birikim = ""
+    for i, ch in enumerate(satir):
+        birikim += _harf_ozu(ch)
+        if len(birikim) >= len(hedef):
+            return satir[i + 1:].strip(_AYRAC_KARAKTERLERI) if birikim[:len(hedef)] == hedef else None
+        if not hedef.startswith(birikim):
+            return None
+    return None
+
+
+def _tamamen_buyuk_harf(satir):
+    harfler = [c for c in satir if c.isalpha()]
+    return len(harfler) >= 4 and all(c.isupper() for c in harfler)
+
+
+def is_adi_talep_formundan(metin, en_cok_satir=12):
+    """Talep Formu'nda metni 'TALEBİN ADI, NİTELİĞİ VE MİKTARI' ile başlayan satırı (belgedeki sırası önemsiz) bulur ve
+    işin adını alır: etiketten sonraki yazı, devam eden satırlarla birlikte, tek başına tarih satırına ('13/01/2026') ya da
+    tamamen büyük harfli bir sonraki başlığa ('TALEP YETKİLİSİ') kadar. Bulunamazsa None."""
+    satirlar = [x.strip() for x in (metin or "").replace("\xa0", " ").splitlines()]
+    for i, satir in enumerate(satirlar):
+        kalan = _etiket_kalani(satir, IS_ADI_ETIKETI)
+        if kalan is None:
+            continue
+        parcalar = [kalan] if kalan else []
+        for devam in satirlar[i + 1:i + 1 + en_cok_satir]:
+            if not devam:
+                continue                                                  # boş satırları atla
+            if _TARIH_SATIRI.match(devam) or _tamamen_buyuk_harf(devam):
+                break
+            parcalar.append(devam)
+        ad = " ".join(" ".join(parcalar).split())
+        if ad:
+            return ad
+    return None
+
+
 def kural_is_adi_pdf(yol, secenek):
     metin = _ilk_sayfa_metni(yol)
     if "talep formu" not in tr_kucuk(metin):          # 'Talep Formu' ve 'Mal Alımı Talep Formu' ikisini de kapsar
         return None, "Bu belge 'Talep Formu' ya da 'Mal Alımı Talep Formu' değil; işin adı okunmadı."
-    deger = is_adi_pdf_tablodan(yol) or is_adi_pdf_metinden(metin)
+    deger = is_adi_talep_formundan(metin)
     if not deger:
-        return None, "PDF'te 'Hizmetin / Malzemenin adı ve karakteristiği' başlığı bulunamadı."
+        return None, "Talep Formu'nda '%s' satırı bulunamadı." % IS_ADI_ETIKETI
     return is_adi_parantez_at(deger), ""
 
 
 OKUMA_KURALLARI = {
     ("is", ".pdf"): kural_is_adi_pdf,
     ("is", ".docx"): kural_docx_etiket("İşin Adı"),
-    ("dt", ".docx"): kural_docx_etiket("Doğrudan Temin Numarası", r"\b\d{2}DT\d{5,}\b"),
+    ("dt", ".docx"): kural_dt_docx,
     ("talep", ".pdf"): kural_talep_pdf,
     ("birim", ".pdf"): kural_birim_pdf,
 }
@@ -2317,12 +2343,15 @@ OKUNABILIR_TURLER = (".pdf", ".docx")
 
 FATURA_ALANLARI = ("tarih", "no", "firma", "haric")
 DOCX_BIRLIKTE = ("is", "dt")     # Doğrudan Temin Onay Belgesi (DOCX) seçilince bu alanlar birlikte doldurulur
+PDF_BIRLIKTE = ("talep", "birim", "is")     # Talep Formu (PDF) seçilince talep no/tarihi, talep eden birim ve işin adı birlikte
 
 
 def okunacak_alanlar(alan, yol):
     """Gözat'a basılan alanla birlikte aynı dosyadan doldurulacak alanlar."""
     if alan in DOCX_BIRLIKTE and yol.lower().endswith(".docx"):
         return list(DOCX_BIRLIKTE)
+    if alan in PDF_BIRLIKTE and yol.lower().endswith(".pdf"):
+        return list(PDF_BIRLIKTE)
     return [alan]
 
 
@@ -2439,6 +2468,24 @@ def pencere_sahibi_ata(pen, sahip):
         except Exception:
             pass
     pen.bind("<Map>", lambda e: uygula() if e.widget is pen else None, add="+")
+
+    def odagi_sahibine_ver(olay):
+        """Tk'nin transient mekanizması pencere kapanınca klavye odağını sahibine geri verirdi; Windows sahipliğinde bunu
+        açıkça yaparız (yoksa Ctrl+F, liste ok tuşları vb. bir tıklama yapılana kadar çalışmaz)."""
+        if olay.widget is not pen:
+            return
+
+        def ver():
+            try:
+                if sahip.winfo_exists():
+                    sahip.focus_lastfor().focus_set()
+            except Exception:
+                pass
+        try:
+            sahip.after_idle(ver)
+        except Exception:
+            pass
+    pen.bind("<Destroy>", odagi_sahibine_ver, add="+")
     uygula()
 
 
@@ -3311,9 +3358,12 @@ def arayuzu_calistir():
                 if hata or not sonuc:
                     v_durum.set("%s okunamadı: %s" % (et, hata or "bilinmeyen hata"))
                     return
-                dolan, eksik = [], []
+                dolan, eksik, korunan = [], [], []
                 for alan, (deger, nt) in sonuc.items():
                     if deger:
+                        if alan != k and yol.lower().endswith(".pdf") and alan in PDF_BIRLIKTE and v[alan].get().strip():
+                            korunan.append(adlar[alan])      # PDF ile birlikte doldurulan DİĞER alanlarda dolu değer korunur
+                            continue
                         v[alan].set(deger)
                         girisler[alan].configure(style="Oto.TEntry")
                         dolan.append(adlar[alan])
@@ -3322,6 +3372,8 @@ def arayuzu_calistir():
                 mesaj = ""
                 if dolan:
                     mesaj = "%s okundu; sarı alanları kontrol edin." % ", ".join(dolan)
+                if korunan:
+                    mesaj = (mesaj + " Dolu olduğu için değiştirilmedi: %s." % ", ".join(korunan)).strip()
                 v_durum.set((mesaj + " " + " ".join(eksik)).strip() if eksik or mesaj else "")
             arka_planda(lambda: alanlari_oku(k, yol, okuma_secenek), bitti)
 

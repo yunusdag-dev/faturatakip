@@ -127,6 +127,8 @@ def senaryo(kok):
     dongu(kok, [bul], "S2", None, tur=2)
     bul.destroy()
     kok.update()
+    kok.update()
+    kontrol("S2 pencere kapanınca klavye odağı ana pencereye döner", kok.focus_get() is not None, str(kok.focus_get()))
     # S3: iç içe modal (Kullanıcılar -> Yeni Kullanıcı)
     m = kok.nametowidget(kok["menu"])
     dosya = m.nametowidget(m.entrycget(0, "menu"))

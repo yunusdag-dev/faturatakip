@@ -34,7 +34,7 @@ To record purchase invoices, to cut the effort and error risk of typing supplier
 
 | | |
 |---|---|
-| **Per-row Browse filling** | In the New Record form (*Yeni Kayıt*) every row has its own *Gözat* (Browse) button; you pick a PDF, DOCX or XLSX. The invoice PDF supplies date, invoice number, supplier and the amount excluding VAT; a Request Form (*Talep Formu*) PDF supplies the request number and date; in a Needs Form (*İhtiyaç Formu*) PDF the text under the "Name and characteristics of the service/material" heading becomes the job name; the Direct Procurement Approval document (DOCX) supplies the procurement number (and, if wanted, the job name). Invoice date, number, supplier and amount are filled together from a single invoice PDF. Results are highlighted in yellow, the user checks and saves; nothing is saved without confirmation. |
+| **Per-row Browse filling** | In the New Record form (*Yeni Kayıt*) every row has its own *Gözat* (Browse) button; you pick a PDF, DOCX or XLSX. The invoice PDF supplies date, invoice number, supplier and the amount excluding VAT; a Request Form (*Talep Formu*) PDF supplies the request number and date; in a Request Form (*Talep Formu*) PDF the text on the line starting with "TALEBİN ADI, NİTELİĞİ VE MİKTARI" becomes the job name (trailing parentheses are dropped); the Direct Procurement Approval document (DOCX) supplies the procurement number (and, if wanted, the job name). Invoice date, number, supplier and amount are filled together from a single invoice PDF; request number/date, requesting unit and job name from a single Request Form PDF; job name and procurement number from a single DOCX. Results are highlighted in yellow, the user checks and saves; nothing is saved without confirmation. |
 | **Category** | Every record belongs to a category (truck rental, fuel, toll passes, etc.); the Excel output gets one sheet per category. |
 | **Multi-page document support** | In a 10-20 page scan it **finds the invoice page automatically** (page scoring); if wrong, type `7` or `7-8` into the "Invoice page" box. |
 | **Scanned (image) PDFs** | Read with the Windows built-in OCR engine; no extra software needed. |
@@ -82,7 +82,7 @@ The code is in a single file (about 2,500 lines) and layered: settings → helpe
    tarama_klasoru = \\SERVER-PC\FaturaTakip\Evraklar
    ```
 4. On the other computers create a shortcut to `\\SERVER-PC\FaturaTakip\Program\FaturaTakip.exe`.
-5. **Updating:** after everyone has closed the program, copy the new files into `Program`; do not touch `config.ini` or `Veri`.
+5. **Updating:** after everyone has closed the program, copy the new files into `Program` (delete the old `_internal` folder first and put the new one in); do not touch `config.ini` or `Veri`. The package deliberately contains **no** `config.ini` (so your network settings cannot be overwritten by accident); on a first install copy `config.ornek.ini` to `config.ini` and fill in the paths.
 6. Back up `Veri\fatura.db` regularly.
 7. **First launch (administrator account):** before distributing the shortcuts, **open the application once from your own computer**. If the database has no accounts, the "First Setup" (*İlk Kurulum*) screen appears; create the administrator account (this screen never appears again). Add the other people under **File > Users** (*Dosya > Kullanıcılar*): you give a user name and a temporary password, and each person sets their own password at first sign-in. Accounts are kept inside `fatura.db` (passwords as salted hashes).
 

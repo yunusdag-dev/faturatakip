@@ -59,8 +59,20 @@ class Hesaplar(unittest.TestCase):
 
     def test_parola_en_az_uzunluk(self):
         with self.assertRaises(f.VeritabaniHatasi):
-            self.db.ilk_yonetici_olustur("Y", "1234567")
+            self.db.ilk_yonetici_olustur("Y", "12345")
         self.assertEqual(self.db.kullanici_sayisi(), 0)
+
+    def test_parola_alt_siniri_6_karakter(self):
+        self.assertEqual(f.SIFRE_EN_AZ, 6)
+        self.db.ilk_yonetici_olustur("Y", "123456")                       # tam 6 karakter kabul edilir
+        with self.assertRaises(f.VeritabaniHatasi):
+            self.db.kullanici_ekle("Ayse", "12345")                       # 5 karakter reddedilir
+        self.db.kullanici_ekle("Ayse", "abcdef", sifre_degismeli=False)
+        a = self.db.giris_dene("ayse", "abcdef")[0]["id"]
+        with self.assertRaises(f.VeritabaniHatasi):
+            self.db.sifre_degistir(a, "abcde")
+        self.db.sifre_degistir(a, "ghijkl")
+        self.assertTrue(self.db.giris_dene("ayse", "ghijkl")[0])
 
     def test_ilk_yonetici_yalniz_bir_kez(self):
         self.db.ilk_yonetici_olustur("Yonetici", "gizli1234")
@@ -195,6 +207,176 @@ class PdfKurallari(unittest.TestCase):
         self.assertEqual(a("Sepetli Vinç Kiralama (1 Adet) (Gölmarmara)"), "Sepetli Vinç Kiralama")
         self.assertEqual(a("Vinç (Sepetli) Kiralama"), "Vinç (Sepetli) Kiralama")
         self.assertEqual(a("(Sadece parantez)"), "(Sadece parantez)")
+
+
+def _docx(paragraflar):
+    """Verilen paragraflardan geçici bir .docx üretir (her paragraf ayrı satır)."""
+    import zipfile
+    ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    govde = "".join("<w:p><w:r><w:t xml:space=\"preserve\">%s</w:t></w:r></w:p>" % p for p in paragraflar)
+    yol = os.path.join(tempfile.mkdtemp(), "b.docx")
+    with zipfile.ZipFile(yol, "w") as z:
+        z.writestr("word/document.xml", "<w:document xmlns:w=\"%s\"><w:body>%s</w:body></w:document>" % (ns, govde))
+    return yol
+
+
+class DocxKurallari(unittest.TestCase):
+    def dt(self, paragraflar):
+        return f.alan_oku("dt", _docx(paragraflar))[0]
+
+    def test_yeni_bicim_etiket_iki_nokta_deger_ayri_satirlarda(self):
+        """Etiket, ':' ve değer ayrı paragraflarda: ':' değer sanılmamalı."""
+        yol = _docx(["DOĞRUDAN TEMİN ONAY BELGESİ", "DOĞRUDAN TEMİN NUMARASI", ":", "26DT5011403", "İŞİN ADI", ":", "Vinç kiralama işi"])
+        self.assertEqual(f.alan_oku("dt", yol)[0], "26DT5011403")
+        self.assertEqual(f.alan_oku("is", yol)[0], "Vinç kiralama işi")
+
+    def test_eski_bicim_etiketin_hemen_alt_satiri(self):
+        yol = _docx(["BAŞLIK", "DOĞRUDAN TEMİN NUMARASI", "26DT141582", "İŞİN ADI", "Eski biçim işi"])
+        self.assertEqual(f.alan_oku("dt", yol)[0], "26DT141582")
+        self.assertEqual(f.alan_oku("is", yol)[0], "Eski biçim işi")
+
+    def test_numara_etiketle_ayni_satirda(self):
+        for satir in ("Doğrudan Temin Numarası: 26DT5011403", "Doğrudan Temin Numarası : 26DT5011403", "Doğrudan Temin Numarası   26DT5011403",
+                      "DOĞRUDAN TEMİN NUMARASI - 26DT5011403 (EKAP)", "doğrudan temin numarası:26dt5011403"):
+            self.assertEqual(self.dt(["x", satir, "y"]), "26DT5011403", satir)
+
+    def test_etiket_satirinin_sirasi_onemsiz(self):
+        for onceki in (0, 4, 11):
+            self.assertEqual(self.dt(["satır %d" % i for i in range(onceki)] + ["Doğrudan Temin Numarası : 26DT7000001"]), "26DT7000001")
+
+    def test_etiketle_baslamayan_satir_etiket_sayilmaz(self):
+        # 'Doğrudan Temin Kapsamı' ve başlıktaki numara etiket değildir; ancak başlıktaki numara yedek olarak okunur
+        self.assertEqual(self.dt(["26DT141582 Doğrudan Temin Alım Kaydı", "Doğrudan Temin Kapsamı"]), "26DT141582")
+        self.assertIsNone(self.dt(["Doğrudan Temin Kapsamı", "Hizmet"]))
+
+    def test_etiket_satiri_oncelikli(self):
+        """Belgede başka bir DT numarası geçse bile 'Doğrudan Temin Numarası' satırındaki alınır."""
+        self.assertEqual(self.dt(["26DT0000001 başlık", "Doğrudan Temin Numarası", ":", "26DT5011403"]), "26DT5011403")
+
+    def test_is_adinda_ayrac_satirlari_atlanir(self):
+        yol = _docx(["İŞİN ADI", ":", "–", "Gerçek değer"])
+        self.assertEqual(f.alan_oku("is", yol)[0], "Gerçek değer")
+
+
+class IsAdiTalepFormu(unittest.TestCase):
+    """PDF'ten İşin Adı: Talep Formu'nda 'TALEBİN ADI, NİTELİĞİ VE MİKTARI' ile başlayan satır."""
+
+    ETIKET = "TALEBİN ADI, NİTELİĞİ VE MİKTARI :"
+
+    def test_etiketle_ayni_satirda_baslayan_iki_satirlik_yazi(self):
+        metin = "\n".join(["TALEP FORMU", "TALEP SAHİBİ BİRİM:X", self.ETIKET + "Bölge Müdürlüğümüze bağlı Hilal TM'de bulunan su",
+                           "deposunun (kampüs alanında bulunan bahçe sulama hattına) monte edilmesi işidir.", "13/01/2026", "Mehmet ÇELİK"])
+        self.assertEqual(f.is_adi_talep_formundan(metin),
+                         "Bölge Müdürlüğümüze bağlı Hilal TM'de bulunan su deposunun (kampüs alanında bulunan bahçe sulama hattına) monte edilmesi işidir.")
+
+    def test_etiket_tek_basina_yazi_alt_satirlarda(self):
+        metin = "\n".join([self.ETIKET, "     1- Sepetli vinç [ 1(bir)adet ] 20/01/2026 tarihinde 154 kV GÖLMARMARA TM 'de test ve bakım",
+                           "     işinde kullanılmak üzere ihtiyaç duyulmuştur.", "     (Not:Sepetli vinçin Saat 09:00 da bulundurulması)",
+                           "20/01/2026", "TALEP YETKİLİSİ"])
+        self.assertEqual(f.is_adi_talep_formundan(metin),
+                         "1- Sepetli vinç [ 1(bir)adet ] 20/01/2026 tarihinde 154 kV GÖLMARMARA TM 'de test ve bakım işinde kullanılmak üzere "
+                         "ihtiyaç duyulmuştur. (Not:Sepetli vinçin Saat 09:00 da bulundurulması)")
+
+    def test_tarih_yoksa_buyuk_harfli_baslikta_durur(self):
+        metin = "\n".join([self.ETIKET + " Vinç kiralama işi", "devamı burada", "TALEP YETKİLİSİ", "Uğur ŞEKER"])
+        self.assertEqual(f.is_adi_talep_formundan(metin), "Vinç kiralama işi devamı burada")
+
+    def test_satir_sirasi_ve_yazim_farklari_onemsiz(self):
+        for onceki in (0, 3, 15):
+            m = "\n".join(["satır %d" % i for i in range(onceki)] + ["TALEBIN ADI,  NITELIGI VE  MIKTARI:Test işi", "13/01/2026"])
+            self.assertEqual(f.is_adi_talep_formundan(m), "Test işi")
+        self.assertEqual(f.is_adi_talep_formundan("talebin adı, niteliği ve miktarı : küçük harf\n01.02.2026"), "küçük harf")
+
+    def test_etiket_yoksa_none(self):
+        self.assertIsNone(f.is_adi_talep_formundan("TALEP FORMU\nYAKLAŞIK MALİYET: 5\n13/01/2026"))
+        self.assertIsNone(f.is_adi_talep_formundan(self.ETIKET + "\n13/01/2026"))          # etiket var ama yazı boş
+
+    @unittest.skipIf(f.fitz is None, "PyMuPDF kurulu değil")
+    def test_pdf_ile_uctan_uca_ve_belge_turu_sarti(self):
+        d = tempfile.mkdtemp()
+
+        def pdf(ad, satirlar):
+            yol = os.path.join(d, ad)
+            belge = f.fitz.open()
+            sayfa = belge.new_page()
+            for i, s in enumerate(satirlar):
+                sayfa.insert_text((50, 60 + 18 * i), s)
+            belge.save(yol)
+            belge.close()
+            return yol
+        talep = pdf("talep.pdf", ["TALEP FORMU", "TALEBIN ADI, NITELIGI VE MIKTARI : Vinc kiralama isi (1 adet) (Manisa)", "13/01/2026"])
+        self.assertEqual(f.alan_oku("is", talep)[0], "Vinc kiralama isi")                 # sondaki parantezler atılır
+        baska = pdf("ihtiyac.pdf", ["HIZMET IHTIYAC FORMU", "TALEBIN ADI, NITELIGI VE MIKTARI : Vinc kiralama isi", "13/01/2026"])
+        deger, uyari = f.alan_oku("is", baska)
+        self.assertIsNone(deger)                                                           # 'Talep Formu' yazmayan belgeden okunmaz
+        self.assertIn("Talep Formu", uyari)
+
+
+class GozatBirlikteDoldurma(unittest.TestCase):
+    """Tek Gözat birden çok alanı doldurur: Talep Formu PDF'inde talep no/tarih + birim + işin adı; DOCX'te işin adı + DT."""
+
+    def test_grup_secimi(self):
+        for alan in ("talep", "birim", "is"):
+            self.assertEqual(f.okunacak_alanlar(alan, "a.pdf"), ["talep", "birim", "is"], alan)
+            self.assertEqual(f.okunacak_alanlar(alan, "A.PDF"), ["talep", "birim", "is"], alan)
+        for alan in ("is", "dt"):
+            self.assertEqual(f.okunacak_alanlar(alan, "a.docx"), ["is", "dt"], alan)       # DOCX grubu değişmedi
+        self.assertEqual(f.okunacak_alanlar("dt", "a.pdf"), ["dt"])
+        self.assertEqual(f.okunacak_alanlar("talep", "a.docx"), ["talep"])
+        self.assertEqual(f.okunacak_alanlar("birim", "a.docx"), ["birim"])
+        self.assertEqual(f.okunacak_alanlar("haric", "a.pdf"), ["haric"])
+
+    @unittest.skipIf(f.fitz is None, "PyMuPDF kurulu değil")
+    def test_talep_formu_pdf_uc_alani_doldurur_ve_bir_kez_okunur(self):
+        d = tempfile.mkdtemp()
+
+        def pdf(ad, satirlar):
+            yol = os.path.join(d, ad)
+            belge = f.fitz.open()
+            sayfa = belge.new_page()
+            for i, s in enumerate(satirlar):
+                sayfa.insert_text((40, 50 + 16 * i), s)
+            belge.save(yol)
+            belge.close()
+            return yol
+        ust = ["T.C.", "GENEL MUDURLUGU", "3.Bolge Mudurlugu (Izmir)", "Manisa Birimi", "Sayi : E-60994212-934.01.99-3570050  23.01.2026"]
+        talep = pdf("talep.pdf", ust + ["TALEP FORMU", "TALEBIN ADI, NITELIGI VE MIKTARI : Vinc kiralama isi (1 adet)", "20/01/2026"])
+        sayac = {"n": 0}
+        asil = f.pdf_sayfa_metinleri_mupdf
+        f.pdf_sayfa_metinleri_mupdf = lambda *a, **k: (sayac.__setitem__("n", sayac["n"] + 1), asil(*a, **k))[1]
+        try:
+            f._ILK_SAYFA_ONBELLEK.clear()
+            sonuc = f.alanlari_oku("birim", talep)
+        finally:
+            f.pdf_sayfa_metinleri_mupdf = asil
+        self.assertEqual(sonuc["talep"][0], "3570050 - 23.01.2026")
+        self.assertEqual(sonuc["birim"][0], "Manisa Birimi")
+        self.assertEqual(sonuc["is"][0], "Vinc kiralama isi")
+        self.assertEqual(sayac["n"], 1, "üç alan için PDF yalnızca bir kez okunmalı")
+        # İhtiyaç Formu (gerçek Türkçe metinle): yalnızca birim dolar, talep no ve işin adı boş kalır (Talep Formu şartı)
+        ihtiyac_metni = "\n".join(["T.C.", "GENEL MÜDÜRLÜĞÜ", "3.Bölge Müdürlüğü (İzmir)", "Manisa Birimi", "Sayı : E-1-3570050  23.01.2026",
+                                   "Hizmet İhtiyaç Formu", "TALEBİN ADI, NİTELİĞİ VE MİKTARI : Vinç işi", "20/01/2026"])
+        asil_metin = f._ilk_sayfa_metni
+        f._ilk_sayfa_metni = lambda yol: ihtiyac_metni
+        try:
+            s2 = f.alanlari_oku("talep", talep)
+        finally:
+            f._ilk_sayfa_metni = asil_metin
+        self.assertEqual(s2["birim"][0], "Manisa Birimi")
+        self.assertIsNone(s2["talep"][0])
+        self.assertIsNone(s2["is"][0])
+
+    @unittest.skipIf(f.fitz is None, "PyMuPDF kurulu değil")
+    def test_onbellek_dosya_degisince_yenilenir(self):
+        d = tempfile.mkdtemp()
+        yol = os.path.join(d, "a.pdf")
+        for metin in ("BIRINCI belge metni burada yeterince uzun bir cumle olsun", "IKINCI belge metni burada yeterince uzun bir cumle"):
+            belge = f.fitz.open()
+            belge.new_page().insert_text((40, 60), metin)
+            belge.save(yol)
+            belge.close()
+            os.utime(yol, (os.path.getmtime(yol) + 5, os.path.getmtime(yol) + 5))          # zaman damgası kesin değişsin
+            self.assertIn(metin.split()[0], f._ilk_sayfa_metni(yol))
 
 
 class Guvenlik(unittest.TestCase):

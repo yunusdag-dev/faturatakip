@@ -32,7 +32,7 @@ Alış faturalarını kaydetmek, her faturada firma / numara / tarih / tutarı e
 
 | | |
 |---|---|
-| **Satır başına Gözat ile doldurma** | Yeni Kayıt formunda her satırın kendi Gözat'ı vardır; PDF, DOCX veya XLSX seçilir. Fatura PDF'inden tarih, fatura no, firma, KDV hariç tutar; Talep Formu PDF'inden talep no ve tarih; İhtiyaç Formu PDF'inde "Hizmetin/Malzemenin adı ve karakteristiği" başlığının altındaki açıklama işin adı olarak, Doğrudan Temin Onay Belgesi (DOCX) içinden DT numarası (ve istenirse işin adı) okunur. Fatura tarihi, no, firma ve tutar tek bir fatura PDF'inden birlikte doldurulur. Sonuçlar sarı işaretlenir, kullanıcı kontrol edip kaydeder; hiçbir şey onaysız kaydedilmez. |
+| **Satır başına Gözat ile doldurma** | Yeni Kayıt formunda her satırın kendi Gözat'ı vardır; PDF, DOCX veya XLSX seçilir. Fatura PDF'inden tarih, fatura no, firma, KDV hariç tutar; Talep Formu PDF'inden talep no ve tarih; Talep Formu PDF'inde "TALEBİN ADI, NİTELİĞİ VE MİKTARI" ile başlayan satırdaki açıklama (sondaki parantezler atılarak) işin adı olarak, Doğrudan Temin Onay Belgesi (DOCX) içinden DT numarası (ve istenirse işin adı) okunur. Fatura tarihi, no, firma ve tutar tek bir fatura PDF'inden; talep no/tarihi, talep eden birim ve işin adı tek bir Talep Formu PDF'inden; işin adı ve DT numarası tek bir DOCX'ten birlikte doldurulur. Sonuçlar sarı işaretlenir, kullanıcı kontrol edip kaydeder; hiçbir şey onaysız kaydedilmez. |
 | **Kategori** | Her kayıt bir kategoriye bağlanır (kamyon kiralama, akaryakıt, HGS vb.); Excel çıktısında kategori başına bir sayfa oluşur. |
 | **Çok sayfalı belge desteği** | 10-20 sayfalık taramada **fatura sayfasını otomatik bulur** (sayfa puanlama); yanlışsa "Fatura sayfası" kutusuna `7` ya da `7-8` yazılır. |
 | **Taranmış (resim) PDF'ler** | Windows'un yerleşik OCR motoru ile okunur; ek program kurmak gerekmez. |
@@ -80,7 +80,7 @@ Kod tek dosyada (yaklaşık 2.500 satır) ve katmanlı: ayarlar → yardımcıla
    tarama_klasoru = \\SUNUCU-PC\FaturaTakip\Evraklar
    ```
 4. Diğer bilgisayarlarda `\\SUNUCU-PC\FaturaTakip\Program\FaturaTakip.exe` için kısayol oluşturun.
-5. **Güncelleme:** herkes programı kapattıktan sonra yeni dosyaları `Program`'a kopyalayın; `config.ini` ve `Veri`'ye dokunmayın.
+5. **Güncelleme:** herkes programı kapattıktan sonra yeni dosyaları `Program`'a kopyalayın (eski `_internal` klasörünü silip yenisini koyun); `config.ini` ve `Veri`'ye dokunmayın. Pakette `config.ini` **yoktur** (ağdaki ayarınız yanlışlıkla ezilmesin diye); ilk kurulumda `config.ornek.ini` dosyasını `config.ini` adıyla kopyalayıp yolları yazın.
 6. `Veri\fatura.db` dosyasını düzenli yedekleyin.
 7. **İlk açılış (yönetici hesabı):** Kısayolları dağıtmadan önce uygulamayı **kendi bilgisayarınızdan bir kez açın**.
    Veritabanında hesap yoksa "İlk Kurulum" ekranı çıkar; yönetici hesabını oluşturun (bu ekran bir daha çıkmaz).
